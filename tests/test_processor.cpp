@@ -123,6 +123,7 @@ static void testStateRoundTrip()
 
 int main()
 {
+    std::setvbuf (stdout, nullptr, _IONBF, 0);   // so a crash still shows which test was running
     ScopedJuceInitialiser_GUI init;
     testLayouts();
     testLatencyAndSidechain();

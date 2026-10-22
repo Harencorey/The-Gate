@@ -142,6 +142,9 @@ void TheGateProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
     const int numCh = main.getNumChannels();
     const int n = buffer.getNumSamples();
 
+    // The sidechain view must outlive engine.process(): its channel-pointer array lives
+    // inside this AudioBuffer object, so it can't be a temporary inside the if-block.
+    AudioBuffer<float> sc;
     const float* const* scPtrs = nullptr;
     int scCh = 0;
     if (getBusCount (true) > 1)
@@ -149,9 +152,9 @@ void TheGateProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
         auto* scBus = getBus (true, 1);
         if (scBus != nullptr && scBus->isEnabled())
         {
-            auto sc = getBusBuffer (buffer, true, 1);
+            sc = getBusBuffer (buffer, true, 1);
             scCh = sc.getNumChannels();
-            scPtrs = sc.getArrayOfReadPointers();
+            scPtrs = scCh > 0 ? sc.getArrayOfReadPointers() : nullptr;
         }
     }
     sidechainActive.store (scCh > 0);
