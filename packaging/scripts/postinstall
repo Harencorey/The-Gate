@@ -1,0 +1,14 @@
+#!/bin/bash
+# Runs as root after The Gate is installed into /Library/Audio/Plug-Ins.
+# Remove any older per-user copies (e.g. from build_mac.sh) so the DAW doesn't see two
+# different versions of The Gate, then make macOS rescan Audio Units.
+CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    USER_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    if [ -n "$USER_HOME" ]; then
+        rm -rf "$USER_HOME/Library/Audio/Plug-Ins/Components/The Gate.component"
+        rm -rf "$USER_HOME/Library/Audio/Plug-Ins/VST3/The Gate.vst3"
+    fi
+fi
+killall -9 AudioComponentRegistrar 2>/dev/null || true
+exit 0

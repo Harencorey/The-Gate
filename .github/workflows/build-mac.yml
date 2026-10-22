@@ -1,0 +1,135 @@
+name: Build macOS installer (AU + VST3 + Standalone)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # lets the workflow publish the Releases page
+
+# only the newest push builds/publishes (an older run would try to tag a stale commit)
+concurrency:
+  group: build-mac
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple Silicon runner; the build itself is universal (arm64 + x86_64)
+    timeout-minutes: 60
+    env:
+      VERSION: 0.1.${{ github.run_number }}
+      ART: build-mac/TheGate_artefacts/Release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # the commit message goes into the version's release notes
+
+      - name: Configure (downloads JUCE 8.0.15)
+        run: cmake -B build-mac -DCMAKE_BUILD_TYPE=Release -DTG_VERSION=${{ env.VERSION }}
+
+      - name: Build
+        run: cmake --build build-mac --config Release --target TheGate_AU TheGate_VST3 TheGate_Standalone GateTests GateProcessorTests -j "$(sysctl -n hw.ncpu)"
+
+      - name: Engine tests (latency, clicks, hold/release/range, block-size independence, no audio-thread allocations)
+        run: ./build-mac/GateTests
+
+      - name: Plug-in tests (bus layouts, sidechain, reported latency, bypass, session save/load)
+        run: ./build-mac/GateProcessorTests_artefacts/Release/GateProcessorTests
+
+      - name: Check binaries are universal
+        run: |
+          lipo -info "$ART/AU/The Gate.component/Contents/MacOS/The Gate"
+          lipo -info "$ART/VST3/The Gate.vst3/Contents/MacOS/The Gate"
+          lipo -info "$ART/Standalone/The Gate.app/Contents/MacOS/The Gate"
+
+      - name: Ad-hoc sign
+        run: |
+          codesign --force --deep --sign - "$ART/AU/The Gate.component"
+          codesign --force --deep --sign - "$ART/VST3/The Gate.vst3"
+          codesign --force --deep --sign - "$ART/Standalone/The Gate.app"
+
+      - name: Build installer
+        run: bash packaging/make_pkg.sh "$ART" "$VERSION" out
+
+      - name: Test the installer (install exactly as a user would)
+        run: |
+          # remove the copies the build step dropped in ~/Library so we only test what the .pkg installs
+          rm -rf ~/Library/Audio/Plug-Ins/Components/"The Gate.component" ~/Library/Audio/Plug-Ins/VST3/"The Gate.vst3"
+          sudo installer -pkg out/TheGate-Installer.pkg -target /
+          ls -la "/Library/Audio/Plug-Ins/Components/The Gate.component" "/Library/Audio/Plug-Ins/VST3/The Gate.vst3"
+          pkgutil --pkgs | grep norkadsp
+
+      - name: Validate installed AU with Apple auval
+        run: |
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 3
+          auval -v aufx Gate Nrka | tee auval.log
+          grep -q "AU VALIDATION SUCCEEDED" auval.log
+
+      - name: Validate installed VST3 + AU with pluginval
+        run: |
+          curl -sSL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip
+          unzip -q pluginval.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process "/Library/Audio/Plug-Ins/VST3/The Gate.vst3"
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process "/Library/Audio/Plug-Ins/Components/The Gate.component"
+
+      - name: Package extras
+        run: |
+          ditto -c -k --keepParent "$ART/Standalone/The Gate.app" out/TheGate-Standalone.app.zip
+          ditto -c -k --keepParent "$ART/AU/The Gate.component" out/TheGate.component.zip
+          ditto -c -k --keepParent "$ART/VST3/The Gate.vst3" out/TheGate.vst3.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TheGate-macOS
+          path: out/*
+          retention-days: 30
+
+      - name: Publish to the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          **The Gate ${VERSION}**, built from ${GITHUB_SHA::7}. Universal (Apple Silicon + Intel).
+          The installer was test-installed on a Mac and passed the engine and plug-in tests, Apple auval and pluginval (strictness 10).
+
+          **Install:** download **TheGate-Installer.pkg** and double-click it.
+          The first time, macOS will say it can't verify the developer (it isn't Apple-notarized yet).
+          Click **Done**, then go to **System Settings > Privacy & Security**, scroll down, and click **Open Anyway** next to TheGate-Installer.
+          (Or right-click the .pkg and choose **Open**.) It installs the AU + VST3 and replaces any older The Gate.
+          Rescan plug-ins in your DAW and look for **Norka DSP > The Gate**. The version is shown in the plug-in window.
+
+          **Standalone (live use):** download **TheGate-Standalone.app.zip**, unzip, and drag the app to Applications.
+          The first launch needs the same Open Anyway step. Allow microphone access, then in **Settings…** pick your interface and untick the input mute. For live playing, set Lookahead to Off or 2 ms.
+
+          The component/vst3 zips are only needed for manual installs.
+          NOTES
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          # point the tag at this commit first, so the release never ends up as an unpublished draft
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin refs/tags/latest
+          gh release create latest out/* --verify-tag --latest --title "The Gate ${VERSION} (latest macOS build)" --notes-file notes.md
+          gh release edit latest --draft=false
+          gh release view latest --json isDraft,url -q '"draft=" + (.isDraft|tostring) + "  " + .url'
+          test "$(gh release view latest --json isDraft -q .isDraft)" = "false"
+
+      - name: Publish a permanent release for this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # "latest" is replaced on every build; this one (v0.1.N) is kept forever so any
+          # past version can be reinstalled. What changed = this commit's message.
+          {
+            echo "**The Gate ${VERSION}**, built from ${GITHUB_SHA::7} on $(date -u +%Y-%m-%d). Passed the engine and plug-in tests, Apple auval and pluginval (strictness 10)."
+            echo
+            echo "### What changed"
+            git log -1 --format=%B "$GITHUB_SHA" | grep -v -E '^(Co-Authored-By|Claude-Session):'
+            echo
+            echo "**Install:** download **TheGate-Installer.pkg** and double-click it (same steps as the latest release). Installing any version replaces whatever The Gate you have."
+          } > version-notes.md
+          gh release delete "v${VERSION}" --yes --cleanup-tag 2>/dev/null || true
+          git tag -f "v${VERSION}" "$GITHUB_SHA"
+          git push -f origin "refs/tags/v${VERSION}"
+          gh release create "v${VERSION}" out/* --verify-tag --latest=false --title "The Gate ${VERSION}" --notes-file version-notes.md
+          gh release edit "v${VERSION}" --draft=false
