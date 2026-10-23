@@ -23,6 +23,15 @@ It ships in stages so every release is something usable in a real session.
 - **One "hit" record** that every feature reads and writes: time, level, pitch curve, class probabilities, confidence, which instance claimed it, original arrival time (before alignment), and distance from the expected bleed.
 - **Real-time safe:** no allocations, locks, file I/O or logging on the audio thread. Learning and network traffic run off the audio thread through lock-free buffers.
 
+## Status
+
+- **Phase 0 + 1: done** (v0.1.3, Oct 22 2026): gate core, CI, installer.
+- **Phase 2: done** (Oct 23 2026): leveler + Micro Glow. Decisions made while building:
+  - Hits are every *stroke*, found on the key's slope (high-frequency content) rather than its level: sample-accurate even for ghost notes on a ringing tail, and in rolls where the gate never closes.
+  - Leveler gain is set from the peak seen during the lookahead and glides in *before* the hit; 5 ms+ lookahead recommended (sees 3.5 ms of each hit).
+  - Micro Glow runs at ~384 kHz like Glow, linear-phase, no DC blocker (zero phase shift), types Tube / Diode / Clip. Its filters add a constant 1 ms of latency, always there so switching it never shifts timing.
+- **Next: Phase 3**, spectral decay.
+
 ## Phases
 
 ### Phase 0: Foundation
