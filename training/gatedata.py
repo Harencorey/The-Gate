@@ -14,14 +14,38 @@ DRUM_OF = {"kick_in": "kick", "kick_port": "kick", "snare_top": "snare", "snare_
            "rack1": "rack1", "rack2": "rack2", "floor1": "floor1", "floor2": "floor2", "hat": "hat", "ride": "ride"}
 
 
+def _read_pcm(path):
+    """Plain RIFF/WAVE PCM reader that tolerates a data chunk whose size isn't a whole number of
+    frames (some DAW exports write that) and ignores every other chunk (bext, cue, iXML...)."""
+    import struct
+    with open(path, "rb") as f:
+        b = f.read()
+    if b[:4] != b"RIFF" or b[8:12] != b"WAVE": raise ValueError(f"{path}: not a WAV file")
+    i, fmt, data = 12, None, None
+    while i + 8 <= len(b):
+        cid, sz = b[i:i + 4], struct.unpack("<I", b[i + 4:i + 8])[0]
+        if cid == b"fmt ": fmt = struct.unpack("<HHIIHH", b[i + 8:i + 24])
+        elif cid == b"data": data = (i + 8, min(sz, len(b) - i - 8))
+        i += 8 + sz + (sz & 1)
+    tag, ch, sr, _, align, bits = fmt
+    raw = np.frombuffer(b, np.uint8, count=data[1] // align * align, offset=data[0])
+    if tag == 3 and bits == 32: x = raw.view("<f4").astype(np.float32)
+    elif bits == 16: x = raw.view("<i2").astype(np.float32) / 32768.0
+    elif bits == 24:
+        t = raw.reshape(-1, 3).astype(np.int32)
+        v = t[:, 0] | (t[:, 1] << 8) | (t[:, 2] << 16)
+        x = (np.where(v >= 1 << 23, v - (1 << 24), v)).astype(np.float32) / 8388608.0
+    elif bits == 32: x = raw.view("<i4").astype(np.float32) / 2147483648.0
+    else: raise ValueError(f"{path}: unsupported {bits}-bit format")
+    return sr, x.reshape(-1, ch)
+
+
 def load(path):
     """Mono float32 in [-1, 1) and the sample rate."""
-    sr, x = wavfile.read(path)
-    if x.dtype == np.int32:   x = x.astype(np.float32) / 2147483648.0     # 24-bit arrives left-justified in int32
-    elif x.dtype == np.int16: x = x.astype(np.float32) / 32768.0
-    else:                     x = x.astype(np.float32)
-    if x.ndim > 1: x = x.mean(axis=1)
-    return x, sr
+    sr, x = _read_pcm(path)
+    if x.shape[1] > 1: x = x.mean(axis=1)
+    else: x = x[:, 0]
+    return np.ascontiguousarray(x, dtype=np.float32), sr
 
 
 def songs(root):
