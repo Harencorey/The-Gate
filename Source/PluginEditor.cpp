@@ -12,6 +12,7 @@ namespace colours
     const Colour accent  { 0xffe8b04a };   // amber
     const Colour open    { 0xff3fbf8f };   // green: gate open
     const Colour key     { 0xff5aa9e6 };   // blue: key level
+    const Colour level   { 0xffd98cf2 };   // violet: leveler
 }
 
 //==============================================================================
@@ -114,11 +115,13 @@ void GateDisplay::paint (Graphics& g)
     {
         // oldest at the left
         const int f0 = (int) (px * framesPerPx), f1 = jmax (f0 + 1, (int) ((px + 1) * framesPerPx));
-        float in = 0, key = -120, gain = 0; bool open = false;
+        float in = 0, key = -120, gain = 0, level = 0, hitDb = 0; bool open = false, hit = false;
         for (int f = f0; f < f1; ++f)
         {
             const auto& fr = history[(size_t) ((head + f) % kFrames)];
             in = jmax (in, fr.inPeak); key = jmax (key, fr.keyDb); gain = jmin (gain, fr.gainDb); open = open || fr.open;
+            level = fr.levelDb;
+            if (fr.hit) { hit = true; hitDb = fr.hitChangeDb; }
         }
         const float x = plot.getX() + (float) px;
         if (open)
@@ -131,12 +134,22 @@ void GateDisplay::paint (Graphics& g)
         const float hgt = plot.getHeight() * 0.5f * (1.0f - jlimit (floorDb, 0.0f, inDb) / floorDb);
         g.setColour (colours::dim.withAlpha (0.45f));
         g.fillRect (x, plot.getCentreY() - hgt, 1.0f, 2.0f * hgt);
-        // what gets through
-        const float outDb = inDb + gain;
+        // what gets through (gate and leveler)
+        const float outDb = inDb + gain + level;
         const float hOut = plot.getHeight() * 0.5f * (1.0f - jlimit (floorDb, 0.0f, outDb) / floorDb);
         g.setColour (colours::text.withAlpha (0.55f));
         g.fillRect (x, plot.getCentreY() - hOut, 1.0f, 2.0f * hOut);
 
+        // leveler: a mark at each hit it moved (up = turned up, down = turned down)
+        if (hit && std::abs (hitDb) >= 0.5f)
+        {
+            Path tri;
+            const float ty = plot.getY() + 4.0f, sz = 4.0f;
+            if (hitDb > 0) tri.addTriangle (x - sz, ty + sz * 1.6f, x + sz, ty + sz * 1.6f, x, ty);
+            else           tri.addTriangle (x - sz, ty, x + sz, ty, x, ty + sz * 1.6f);
+            g.setColour (colours::level);
+            g.fillPath (tri);
+        }
         if (px == 0) { keyPath.startNewSubPath (x, yFor (key)); gainPath.startNewSubPath (x, yFor (gain)); }
         else         { keyPath.lineTo (x, yFor (key));          gainPath.lineTo (x, yFor (gain)); }
     }
@@ -157,7 +170,7 @@ void GateDisplay::paint (Graphics& g)
     // legend, bottom-left
     const float ly = plot.getBottom() - 14;
     g.setColour (colours::bg.withAlpha (0.7f));
-    g.fillRoundedRectangle (plot.getX() + 2, ly - 2, 214, 16, 3.0f);
+    g.fillRoundedRectangle (plot.getX() + 2, ly - 2, 290, 16, 3.0f);
     auto item = [&] (float x, Colour c, const char* t)
     {
         g.setColour (c); g.fillRect (x, ly + 5, 10.0f, 2.0f);
@@ -166,6 +179,11 @@ void GateDisplay::paint (Graphics& g)
     item (plot.getX() + 8,   colours::key,    "KEY");
     item (plot.getX() + 52,  colours::accent, "GAIN");
     item (plot.getX() + 100, colours::open,   "THRESHOLD");
+    g.setColour (colours::level);
+    Path tri; tri.addTriangle (plot.getX() + 190, ly + 9, plot.getX() + 198, ly + 9, plot.getX() + 194, ly + 2);
+    g.fillPath (tri);
+    g.setColour (colours::dim);
+    g.drawText ("LEVELED", Rectangle<float> (plot.getX() + 204, ly, 70, 12), Justification::left);
 }
 
 //==============================================================================
@@ -188,12 +206,29 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     makeChoice (lookahead, tg::pid::lookahead, "LOOKAHEAD", "How far ahead the gate looks. More = cleaner openings, more latency (reported to the host). Use Off or 2 ms for live playing.");
     makeChoice (keySource, tg::pid::keySource, "KEY",       "What the gate listens to: its own input, or the sidechain input.");
 
+    makeKnob (levelAmount, tg::pid::levelAmount, "AMOUNT", "How much of the gap to the target each hit closes. 100 % = every hit lands on the target; 50 % = halfway.");
+    makeKnob (levelTarget, tg::pid::levelTarget, "TARGET", "The peak level hits are evened towards. Bottom = Auto: the running average of the last few hits, so the overall level stays put and only the hit-to-hit differences shrink.");
+    makeKnob (levelMax,    tg::pid::levelMax,    "MAX",    "The most any single hit is turned up or down.");
+    makeKnob (glowDrive,   tg::pid::glowDrive,   "DRIVE",  "Gain into Micro Glow. Below the ceiling it's just level; past it, peaks saturate.");
+    makeKnob (glowCeiling, tg::pid::glowCeiling, "CEILING","The level peaks can't go past. Everything well below it is untouched.");
+    makeChoice (glowType, tg::pid::glowType, "TYPE", "TUBE: Glow's tube output stage, soft with a little 2nd harmonic. DIODE: Glow's diode, softer and warmer (more 2nd). CLIP: near-hard and symmetric, odd harmonics only: shaves peaks flat.");
+
+    auto setupOn = [this] (TextButton& b, const char* id, std::unique_ptr<AudioProcessorValueTreeState::ButtonAttachment>& att, const String& tip)
+    {
+        b.setClickingTogglesState (true);
+        b.setTooltip (tip);
+        addAndMakeVisible (b);
+        att = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, id, b);
+    };
+    setupOn (levelerOn, tg::pid::levelerOn, levelerOnAtt, "Leveler on/off. Evens out soft and loud hits: each hit's peak is measured during the lookahead and its gain set before it plays, so transients are never ramped. Works best with 5 ms lookahead or more.");
+    setupOn (glowOn,    tg::pid::glowOn,    glowOnAtt,    "Micro Glow on/off: a saturator/clipper from Glow at the output, after the gate and leveler, oversampled to ~384 kHz and linear-phase. Switching it never changes the latency.");
+
     listen.setClickingTogglesState (true);
     listen.setTooltip ("Hear the key exactly as the detector hears it (after the key HPF and high cut).");
     addAndMakeVisible (listen);
     listenAtt = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, tg::pid::listen, listen);
 
-    setSize (820, 470);
+    setSize (820, 632);
     startTimerHz (30);
 }
 
@@ -230,7 +265,15 @@ void TheGateEditor::makeChoice (Choice& c, const char* id, const String& name, c
     c.att = std::make_unique<AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, id, c.box);
 }
 
-void TheGateEditor::timerCallback() { display.pull(); }
+void TheGateEditor::timerCallback()
+{
+    display.pull();
+    // dim a section's controls while it's off
+    const float lvl = levelerOn.getToggleState() ? 1.0f : 0.4f, glw = glowOn.getToggleState() ? 1.0f : 0.4f;
+    for (auto* k : { &levelAmount, &levelTarget, &levelMax }) { k->slider.setAlpha (lvl); k->label.setAlpha (lvl); }
+    for (auto* k : { &glowDrive, &glowCeiling }) { k->slider.setAlpha (glw); k->label.setAlpha (glw); }
+    glowType.box.setAlpha (glw); glowType.label.setAlpha (glw);
+}
 
 void TheGateEditor::paint (Graphics& g)
 {
@@ -243,7 +286,8 @@ void TheGateEditor::paint (Graphics& g)
     g.setFont (FontOptions (11.0f));
     g.drawText ("NORKA DSP   v" + String (JucePlugin_VersionString), header, Justification::centredRight);
 
-    for (auto [area, title] : { std::pair { detectArea, "DETECT" }, std::pair { envArea, "ENVELOPE" }, std::pair { keyArea, "KEY FILTERS" } })
+    for (auto [area, title] : { std::pair { detectArea, "DETECT" }, std::pair { envArea, "ENVELOPE" }, std::pair { keyArea, "KEY FILTERS" },
+                                std::pair { levelArea, "LEVELER" }, std::pair { glowArea, "MICRO GLOW" } })
     {
         g.setColour (colours::panel);
         g.fillRoundedRectangle (area.toFloat(), 6.0f);
@@ -268,7 +312,9 @@ void TheGateEditor::resized()
     display.setBounds (r.removeFromTop (190));
     r.removeFromTop (10);
 
-    auto row = r;
+    auto row = r.removeFromTop (210);
+    r.removeFromTop (8);
+    auto row2 = r;
     detectArea = row.removeFromLeft (230);
     row.removeFromLeft (8);
     envArea = row.removeFromLeft (310);
@@ -312,5 +358,25 @@ void TheGateEditor::resized()
         keySource.box.setBounds (left.removeFromTop (24).reduced (10, 0));
         bottom.removeFromTop (14);
         listen.setBounds (bottom.removeFromTop (24).reduced (10, 0));
+    }
+
+    levelArea = row2.removeFromLeft (row2.getWidth() / 2 - 4);
+    row2.removeFromLeft (8);
+    glowArea = row2;
+    levelerOn.setBounds (levelArea.getRight() - 54, levelArea.getY() + 6, 44, 20);
+    glowOn.setBounds (glowArea.getRight() - 54, glowArea.getY() + 6, 44, 20);
+    {
+        auto a = levelArea.reduced (8).withTrimmedTop (22);
+        auto cols = columns (a.removeFromTop (120), 3);
+        placeKnob (levelAmount, cols[0]); placeKnob (levelTarget, cols[1]); placeKnob (levelMax, cols[2]);
+    }
+    {
+        auto a = glowArea.reduced (8).withTrimmedTop (22);
+        auto cols = columns (a.removeFromTop (120), 3);
+        auto t = cols[0].reduced (4, 0);
+        t.removeFromTop (34);
+        glowType.label.setBounds (t.removeFromTop (16));
+        glowType.box.setBounds (t.removeFromTop (26));
+        placeKnob (glowDrive, cols[1]); placeKnob (glowCeiling, cols[2]);
     }
 }

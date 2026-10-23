@@ -50,7 +50,7 @@ static void testLatencyAndSidechain()
         setLayout (p, AudioChannelSet::stereo(), AudioChannelSet::stereo());
         setParam (p, tg::pid::lookahead, 3.0f);   // 10 ms
         p.prepareToPlay (sr, 256);
-        const int L = (int) std::lround (0.010 * sr);
+        const int L = (int) std::lround (0.010 * sr) + (sr < 60000 ? 48 : 46);   // lookahead + Micro Glow's filters
         CHECK (p.getLatencySamples() == L, "sr %.0f latency %d, expected %d", sr, p.getLatencySamples(), L);
 
         // main = steady tone, sidechain = silence then a burst
@@ -95,7 +95,7 @@ static void testBypassLatency()
     buf.setSample (0, 10, 1.0f);
     MidiBuffer midi;
     p.processBlockBypassed (buf, midi);
-    CHECK (L == 240 && buf.getSample (0, 10 + L) == 1.0f, "bypassed impulse not delayed by %d", L);
+    CHECK (L == 240 + 48 && buf.getSample (0, 10 + L) == 1.0f, "bypassed impulse not delayed by %d", L);
 }
 
 static void testStateRoundTrip()
@@ -109,6 +109,14 @@ static void testStateRoundTrip()
     setParam (a, tg::pid::keyHpf, 220.0f);
     setParam (a, tg::pid::tracking, 65.0f);
     setParam (a, tg::pid::listen, 1.0f);
+    setParam (a, tg::pid::levelerOn, 1.0f);
+    setParam (a, tg::pid::levelAmount, 40.0f);
+    setParam (a, tg::pid::levelTarget, -18.0f);
+    setParam (a, tg::pid::levelMax, 9.0f);
+    setParam (a, tg::pid::glowOn, 1.0f);
+    setParam (a, tg::pid::glowType, 2.0f);
+    setParam (a, tg::pid::glowDrive, 7.5f);
+    setParam (a, tg::pid::glowCeiling, -4.0f);
     MemoryBlock mb;
     a.getStateInformation (mb);
     TheGateProcessor b;
@@ -121,6 +129,38 @@ static void testStateRoundTrip()
     }
 }
 
+static void testPhase2Params()
+{
+    std::printf ("Leveler and Micro Glow controls reach the engine; latency doesn't move when Micro Glow toggles\n");
+    TheGateProcessor p;
+    setLayout (p, AudioChannelSet::mono(), AudioChannelSet::disabled());
+    setParam (p, tg::pid::range, 0.0f);   // gate fully open
+    setParam (p, tg::pid::glowOn, 1.0f);
+    setParam (p, tg::pid::glowType, 2.0f);
+    setParam (p, tg::pid::glowDrive, 12.0f);
+    setParam (p, tg::pid::glowCeiling, -6.0f);
+    p.prepareToPlay (48000, 256);
+    const int L0 = p.getLatencySamples();
+    AudioBuffer<float> buf (1, 256);
+    MidiBuffer midi;
+    float pk = 0;
+    for (int blk = 0; blk < 100; ++blk)
+    {
+        for (int i = 0; i < 256; ++i) buf.setSample (0, i, 0.5f * (float) std::sin (2 * MathConstants<double>::pi * 100 * (blk * 256 + i) / 48000.0));
+        p.processBlock (buf, midi);
+        if (blk > 20) pk = std::max (pk, buf.getMagnitude (0, 256));
+    }
+    CHECK (std::abs (Decibels::gainToDecibels (pk) + 6.0f) < 0.3f, "Micro Glow ceiling not applied (peak %.2f dBFS)", Decibels::gainToDecibels (pk));
+    setParam (p, tg::pid::glowOn, 0.0f);
+    p.processBlock (buf, midi);
+    CHECK (p.getLatencySamples() == L0, "latency changed when Micro Glow switched off");
+
+    // Target knob bottom = Auto
+    auto* t = p.apvts.getParameter (tg::pid::levelTarget);
+    t->setValueNotifyingHost (0.0f);
+    CHECK (t->getCurrentValueAsText() == "Auto", "Target bottom shows '%s'", t->getCurrentValueAsText().toRawUTF8());
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);   // so a crash still shows which test was running
@@ -129,6 +169,7 @@ int main()
     testLatencyAndSidechain();
     testBypassLatency();
     testStateRoundTrip();
+    testPhase2Params();
     std::printf ("\n%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }

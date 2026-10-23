@@ -101,7 +101,7 @@ static void testRangeZeroIsTransparent()
             tg::GateSettings s; s.rangeDb = 0.0f; s.lookaheadMs = laMs; s.thresholdDb = -20.0f;
             Buf out = run (in, s, sr, 0);
             tg::GateEngine e; e.prepare (sr, 2);
-            const int L = e.lookaheadSamples (laMs);
+            const int L = e.latencyFor (laMs);
             bool same = true;
             for (int c = 0; c < 2; ++c)
                 for (size_t i = (size_t) L; i < n; ++i)
@@ -119,7 +119,8 @@ static void testOpenIsBitIdentical()
     for (size_t i = 0; i < n; ++i) { in[0][i] = 0.5f * (float) std::sin (2 * M_PI * 220 * i / sr); in[1][i] = 0.3f * (float) std::sin (2 * M_PI * 330 * i / sr); }
     tg::GateSettings s; s.thresholdDb = -30.0f;
     Buf out = run (in, s, sr, 0);
-    const int L = (int) std::lround (0.005 * sr);
+    tg::GateEngine e0; e0.prepare (sr, 2);
+    const int L = e0.latencyFor (5.0f);
     bool same = true;
     for (int c = 0; c < 2; ++c)
         for (size_t i = 4800; i < n; ++i) same &= out[(size_t) c][i] == in[(size_t) c][i - (size_t) L];
@@ -140,7 +141,8 @@ static void testLatencyAndTransientIntact()
             tg::GateEngine e;
             Buf out = run (in, s, sr, 0, nullptr, 2, &e);
             const int L = e.currentLatency();
-            CHECK (L == e.lookaheadSamples (laMs), "latency mismatch");
+            CHECK (L == e.lookaheadSamples (laMs) + e.glowLatency(), "latency mismatch");
+            CHECK (e.glowLatency() == (sr < 60000 ? 48 : 46), "Micro Glow latency %d at %.0f", e.glowLatency(), sr);
             size_t firstIn = 0, firstOut = 0;
             while (firstIn < n && in[0][firstIn] == 0.0f) ++firstIn;
             while (firstOut < n && std::abs (out[0][firstOut]) < 1e-9f) ++firstOut;
@@ -196,7 +198,7 @@ static void testLookaheadChangeIsClickFree()
     }
     const double bound = 0.5 * (2 * M_PI * 100 / sr + 1.0 / tg::GateEngine::kLookaheadFade) * 1.05;
     CHECK (worst <= bound, "jump %.4f > %.4f", worst, bound);
-    CHECK (e.currentLatency() == e.lookaheadSamples (2.0f), "lookahead didn't switch");
+    CHECK (e.currentLatency() == e.latencyFor (2.0f), "lookahead didn't switch");
 }
 
 static Buf makeDrumTrack (double sr, size_t n, unsigned seed)
@@ -224,6 +226,8 @@ static void testBlockSizeIndependence()
         tg::GateSettings s;
         s.keyHpfHz = 80.0f; s.keyHighCutHz = 8000.0f; s.trackingPct = 70.0f; s.rangeDb = -40.0f; s.holdMs = 15.0f;
         s.externalKey = variant & 1; s.listen = variant == 2; s.lookaheadMs = variant == 3 ? 0.0f : 10.0f;
+        s.levelerOn = true; s.levelTarget = variant == 1 ? -10.0f : tg::GateSettings::kAutoTarget;
+        s.glow.on = variant != 2; s.glow.type = variant % 3; s.glow.driveDb = 9.0f; s.glow.ceilingDb = -3.0f;
         Buf a = run (in, s, sr, 512, &key);
         Buf b = run (in, s, sr, 0, &key, 99);
         Buf c = run (in, s, sr, 1, &key);
@@ -241,6 +245,7 @@ static void testNoAllocations()
     const size_t n = (size_t) sr * 2;
     Buf in = makeDrumTrack (sr, n, 21), key = makeDrumTrack (sr, n, 22);
     tg::GateSettings s; s.keyHpfHz = 60.0f; s.trackingPct = 100.0f; s.externalKey = true;
+    s.levelerOn = true; s.glow.on = true; s.glow.driveDb = 12.0f; s.glow.type = tg::MicroGlow::diode;
     tg::GateEngine e;
     e.prepare (sr, 2);
     run (in, s, sr, 0, &key, 5, &e, true);
@@ -364,12 +369,13 @@ static void testHitsAndExternalKey()
         const long dt = (long) hs[i].arrivalSample - (long) starts[i];
         std::printf ("  hit %d: arrived %+ld samples from the strike, peak %.1f dBFS, output time %llu\n", (int) i, dt, hs[i].peakDb, (unsigned long long) hs[i].timeSamples);
         CHECK (dt >= 0 && dt < 48, "hit %d detected %ld samples off", (int) i, dt);
-        CHECK (hs[i].timeSamples == hs[i].arrivalSample + 240, "hit %d output time not shifted by the lookahead", (int) i);
+        CHECK (hs[i].timeSamples == hs[i].arrivalSample + (uint64_t) e.currentLatency(), "hit %d output time not shifted by the latency", (int) i);
     }
     if (hs.size() == 3) CHECK (hs[0].peakDb > hs[1].peakDb && hs[1].peakDb > hs[2].peakDb, "hit levels out of order");
     // audio between hits is gated shut, audio during a hit passes
     CHECK (std::abs (out[0][2000]) < 1e-6f, "gate open before the first key hit");
-    double during = 0; for (size_t i = 4800 + 240; i < 4800 + 2400; ++i) during = std::max (during, (double) std::abs (out[0][i]));
+    const size_t L = (size_t) e.currentLatency();
+    double during = 0; for (size_t i = 4800 + L; i < 4800 + 2400; ++i) during = std::max (during, (double) std::abs (out[0][i]));
     CHECK (during > 0.24, "gate didn't open on the key hit");
 }
 
@@ -382,7 +388,7 @@ static void testBypassKeepsLatency()
     std::vector<float> x (2048, 0.0f); x[100] = 1.0f;
     float* p = x.data();
     e.processBypassed (&p, 1, 2048);
-    CHECK (x[100 + 480] == 1.0f, "bypassed impulse not delayed by the lookahead");
+    CHECK (x[100 + (size_t) e.currentLatency()] == 1.0f, "bypassed impulse not delayed by the latency");
 }
 
 static void testListenAndStability()
@@ -403,6 +409,372 @@ static void testListenAndStability()
     CHECK (finite, "non-finite output");
 }
 
+
+//==============================================================================
+// Phase 2: leveler
+//==============================================================================
+
+// A hit-only track: hits with the given peak levels (dBFS), 250 ms apart. Returns the start samples.
+static std::vector<size_t> makeHits (std::vector<float>& x, double sr, const std::vector<float>& peaksDb, size_t spacing, float decayMs = 60.0f)
+{
+    std::vector<size_t> starts;
+    size_t at = 2400;
+    for (float pdb : peaksDb)
+    {
+        std::vector<float> one ((size_t) (decayMs * 0.001 * sr * 6), 0.0f);
+        addHit (one, 0, 1.0f, 110.0f, sr, decayMs, (unsigned) at);
+        float pk = 0; for (float v : one) pk = std::max (pk, std::abs (v));
+        const float scale = dbToLin (pdb) / pk;
+        for (size_t i = 0; i < one.size() && at + i < x.size(); ++i) x[at + i] += one[i] * scale;
+        starts.push_back (at);
+        at += spacing;
+    }
+    return starts;
+}
+
+static float peakDbIn (const std::vector<float>& x, size_t from, size_t to)
+{
+    float pk = 0; for (size_t i = from; i < std::min (to, x.size()); ++i) pk = std::max (pk, std::abs (x[i]));
+    return 20.0f * std::log10 (std::max (pk, 1e-9f));
+}
+
+static tg::GateSettings levelerSettings()
+{
+    tg::GateSettings s;
+    s.thresholdDb = -40.0f; s.holdMs = 20.0f; s.releaseMs = 100.0f; s.lookaheadMs = 5.0f;
+    s.levelerOn = true; s.levelAmount = 100.0f; s.levelTarget = -12.0f; s.levelMaxDb = 24.0f;
+    return s;
+}
+
+static void testLevelerFixedTarget()
+{
+    std::printf ("Leveler: every hit lands on the target; Amount and Max scale and limit the change\n");
+    const double sr = 48000;
+    const std::vector<float> peaks { -6, -20, -3, -15, -24, -9, -18, -12, -4, -22 };
+    Buf in = makeBuf (1, 12000 * peaks.size() + 24000);
+    const auto starts = makeHits (in[0], sr, peaks, 12000);
+
+    for (float amount : { 100.0f, 50.0f })
+        for (float maxDb : { 24.0f, 6.0f })
+        {
+            tg::GateSettings s = levelerSettings(); s.levelAmount = amount; s.levelMaxDb = maxDb;
+            tg::GateEngine e;
+            Buf out = run (in, s, sr, 0, nullptr, 3, &e);
+            const size_t L = (size_t) e.currentLatency();
+            double worst = 0;
+            for (size_t k = 0; k < starts.size(); ++k)
+            {
+                const float inPk  = peakDbIn (in[0], starts[k], starts[k] + 480);
+                const float outPk = peakDbIn (out[0], starts[k] + L, starts[k] + L + 480);
+                const float want  = inPk + std::clamp (amount * 0.01f * (-12.0f - inPk), -maxDb, maxDb);
+                worst = std::max (worst, (double) std::abs (outPk - want));
+            }
+            std::printf ("  amount %3.0f %%, max %2.0f dB: worst hit %.3f dB from where it should land\n", amount, maxDb, worst);
+            CHECK (worst < 0.05, "amount %.0f max %.0f: off by %.3f dB", amount, maxDb, worst);
+        }
+}
+
+static void testLevelerAuto()
+{
+    std::printf ("Leveler Auto: evens hits around their own average (no target to set)\n");
+    const double sr = 48000;
+    std::vector<float> peaks;
+    std::mt19937 rng (5);
+    std::uniform_real_distribution<float> u (-14.0f, -2.0f);
+    for (int k = 0; k < 40; ++k) peaks.push_back (u (rng));
+    Buf in = makeBuf (1, 12000 * peaks.size() + 24000);
+    const auto starts = makeHits (in[0], sr, peaks, 12000);
+    tg::GateSettings s = levelerSettings(); s.levelTarget = tg::GateSettings::kAutoTarget;
+    tg::GateEngine e;
+    Buf out = run (in, s, sr, 0, nullptr, 3, &e);
+    const size_t L = (size_t) e.currentLatency();
+    auto spread = [&] (const std::vector<float>& x, size_t off)
+    {
+        float lo = 1e9f, hi = -1e9f, sum = 0;
+        for (size_t k = 8; k < starts.size(); ++k)
+        {
+            const float p = peakDbIn (x, starts[k] + off, starts[k] + off + 480);
+            lo = std::min (lo, p); hi = std::max (hi, p); sum += p;
+        }
+        return std::make_pair (hi - lo, sum / (float) (starts.size() - 8));
+    };
+    const auto [inSpread, inMean] = spread (in[0], 0);
+    const auto [outSpread, outMean] = spread (out[0], L);
+    std::printf ("  hit-to-hit spread %.1f dB -> %.1f dB, average level %.1f -> %.1f dBFS\n", inSpread, outSpread, inMean, outMean);
+    CHECK (outSpread < 0.4f * inSpread, "spread only went from %.1f to %.1f dB", inSpread, outSpread);
+    CHECK (std::abs (outMean - inMean) < 1.5f, "Auto moved the overall level by %.1f dB", outMean - inMean);
+}
+
+static void testLevelerTransientUntouched()
+{
+    std::printf ("Leveler: the gain is in place before the hit, so the transient is never ramped\n");
+    std::printf ("  (it judges each hit by what it sees before committing: lookahead - glide - 0.5 ms)\n");
+    const double sr = 48000;
+    for (float laMs : { 2.0f, 5.0f, 10.0f, 20.0f })
+    {
+        Buf in = makeBuf (1, 48000);
+        const auto starts = makeHits (in[0], sr, { -3.0f, -21.0f, -6.0f }, 9000);   // loud, soft (+9 dB), loud (-6 dB)
+        tg::GateSettings s = levelerSettings(); s.lookaheadMs = laMs;
+        tg::GateEngine e;
+        Buf out = run (in, s, sr, 0, nullptr, 7, &e);
+        const size_t L = (size_t) e.currentLatency();
+        for (size_t k = 1; k < 3; ++k)
+        {
+            // over the hit's first 20 ms, output / input must be one constant gain
+            double gMin = 1e9, gMax = 0;
+            for (size_t i = starts[k]; i < starts[k] + 960; ++i)
+                if (std::abs (in[0][i]) > 1e-3f)
+                {
+                    const double gk = out[0][i + L] / in[0][i];
+                    gMin = std::min (gMin, gk); gMax = std::max (gMax, gk);
+                }
+            const int la = (int) std::lround (laMs * 48), G = std::clamp (la / 4, 1, 48), P = std::min (24, la / 8);
+            const size_t W = (size_t) (la - G - P);
+            const double expect = std::pow (10.0, (-12.0 - peakDbIn (in[0], starts[k], starts[k] + W)) / 20.0);
+            if (k == 1) std::printf ("  lookahead %2.0f ms: sees the first %.2f ms of each hit\n", laMs, W / 48.0);
+            CHECK (gMax / gMin < 1.0001, "lookahead %.0f hit %d: gain moved %.4f dB during the hit", laMs, (int) k, 20 * std::log10 (gMax / gMin));
+            CHECK (std::abs (20 * std::log10 (gMin / expect)) < 0.05, "lookahead %.0f hit %d: gain %.2f dB, expected %.2f", laMs, (int) k, 20 * std::log10 (gMin), 20 * std::log10 (expect));
+        }
+    }
+}
+
+static void testLevelerRolls()
+{
+    std::printf ("Leveler: every stroke of a roll is a new hit, even though the gate never closes\n");
+    const double sr = 48000;
+    Buf in = makeBuf (1, 48000);
+    std::vector<size_t> starts;
+    for (int k = 0; k < 16; ++k)
+    {
+        const size_t at = 2400 + (size_t) k * 1920;   // 40 ms apart, loud/soft alternating
+        addHit (in[0], at, k % 2 ? 0.15f : 0.7f, 180.0f, sr, 12.0f, (unsigned) k);
+        starts.push_back (at);
+    }
+    tg::GateSettings s = levelerSettings(); s.holdMs = 200.0f;
+    tg::GateEngine e;
+    Buf out = run (in, s, sr, 0, nullptr, 9, &e);
+    int n = 0; tg::Hit h; while (e.hits.pop (h)) ++n;
+    const size_t L = (size_t) e.currentLatency();
+    double lo = 1e9, hi = -1e9;
+    for (size_t k = 1; k < starts.size(); ++k)
+    {
+        const double p = peakDbIn (out[0], starts[k] + L, starts[k] + L + 240);
+        lo = std::min (lo, p); hi = std::max (hi, p);
+    }
+    std::printf ("  %d strokes -> %d hits; leveled strokes within %.2f dB of each other (input: %.1f dB apart)\n",
+                 (int) starts.size(), n, hi - lo, 20 * std::log10 (0.7 / 0.15));
+    CHECK (n == (int) starts.size(), "%d hits for %d strokes", n, (int) starts.size());
+    CHECK (hi - lo < 0.5, "strokes still %.2f dB apart", hi - lo);
+}
+
+static void testLevelerNoLookahead()
+{
+    std::printf ("Leveler with Lookahead Off still levels (gain lands 2 ms into the hit)\n");
+    const double sr = 48000;
+    Buf in = makeBuf (1, 48000);
+    const auto starts = makeHits (in[0], sr, { -3.0f, -21.0f }, 12000);
+    tg::GateSettings s = levelerSettings(); s.lookaheadMs = 0.0f;
+    tg::GateEngine e;
+    Buf out = run (in, s, sr, 0, nullptr, 2, &e);
+    const size_t L = (size_t) e.currentLatency(), i = starts[1] + 240;   // 5 ms into the soft hit
+    const double gotDb = 20 * std::log10 (std::abs (out[0][i + L] / in[0][i]));
+    const double wantDb = -12.0 - peakDbIn (in[0], starts[1], starts[1] + 48);
+    std::printf ("  5 ms into the soft hit: %+.2f dB (aimed %+.2f from the first 1 ms)\n", gotDb, wantDb);
+    CHECK (std::abs (gotDb - wantDb) < 0.05, "gain %.2f dB, expected %.2f", gotDb, wantDb);
+}
+
+static void testLevelerClickFreeAndOff()
+{
+    std::printf ("Leveler: gain changes and On/Off are click-free; Off is bit-identical\n");
+    const double sr = 48000;
+    const size_t n = (size_t) sr * 3;
+    Buf in = makeBuf (1, n), key = makeBuf (1, n);
+    for (size_t i = 0; i < n; ++i) in[0][i] = 0.5f * (float) std::sin (2 * M_PI * 100 * i / sr);
+    std::mt19937 rng (3);
+    std::uniform_real_distribution<float> u (0.05f, 0.9f);
+    for (size_t at = 1000; at + 3000 < n; at += 6000) addHit (key[0], at, u (rng), 200.0f, sr, 20.0f, (unsigned) at);
+    tg::GateSettings s = levelerSettings(); s.externalKey = true; s.rangeDb = 0.0f; s.levelMaxDb = 12.0f; s.levelTarget = -6.0f;
+    tg::GateEngine e; e.prepare (sr, 1); e.setSettings (s); e.reset();
+    std::vector<float> x = in[0];
+    double worst = 0; float prev = 0;
+    for (size_t pos = 0; pos < n; pos += 256)
+    {
+        s.levelerOn = ((pos / 12000) % 2) == 0;
+        e.setSettings (s);
+        float* p = x.data() + pos; const float* kp = key[0].data() + pos;
+        e.process (&p, 1, &kp, 1, (int) std::min<size_t> (256, n - pos));
+        tg::MeterFrame f; while (e.meters.pop (f)) {}
+        for (size_t i = 0; i < 256 && pos + i < n; ++i) { if (pos + i > 0) worst = std::max (worst, (double) std::abs (p[i] - prev)); prev = p[i]; }
+    }
+    // 12 dB over a 1 ms glide on a 0.5 sine: ~0.5 * (4 - 1) / 48 per sample, plus the sine's own slope
+    const double bound = 0.5 * 2 * M_PI * 100 / sr * 4.0 + 0.5 * (3.98 - 1.0) / 48.0;
+    std::printf ("  worst sample-to-sample jump %.4f (bound %.4f)\n", worst, bound);
+    CHECK (worst <= bound, "jump %.4f", worst);
+
+    tg::GateSettings a = levelerSettings(); a.levelerOn = false;
+    tg::GateSettings b = a; b.levelAmount = 0.0f; b.levelMaxDb = 0.0f;
+    Buf drums = makeDrumTrack (sr, n, 4);
+    Buf oa = run (drums, a, sr, 0), ob = run (drums, b, sr, 0);
+    CHECK (oa == ob, "leveler Off isn't bit-identical");
+}
+
+//==============================================================================
+// Phase 2: Micro Glow
+//==============================================================================
+
+static double goertzelDb (const std::vector<float>& x, size_t from, size_t len, double f, double sr)
+{
+    // windowed (Blackman-Harris) single-bin DFT, amplitude in dBFS
+    const double w = 2 * M_PI * f / sr;
+    double re = 0, im = 0, wsum = 0;
+    for (size_t i = 0; i < len; ++i)
+    {
+        const double t = (double) i / (double) (len - 1);
+        const double win = 0.35875 - 0.48829 * std::cos (2 * M_PI * t) + 0.14128 * std::cos (4 * M_PI * t) - 0.01168 * std::cos (6 * M_PI * t);
+        re += win * x[from + i] * std::cos (w * (double) i);
+        im -= win * x[from + i] * std::sin (w * (double) i);
+        wsum += win;
+    }
+    return 20 * std::log10 (std::max (2 * std::sqrt (re * re + im * im) / wsum, 1e-12));
+}
+
+static tg::GateSettings glowSettings (int type, float drive, float ceiling)
+{
+    tg::GateSettings s; s.rangeDb = 0.0f;   // gate fully open: only Micro Glow acts
+    s.glow.on = true; s.glow.type = type; s.glow.driveDb = drive; s.glow.ceilingDb = ceiling;
+    return s;
+}
+
+static void testGlowTransparentBelowKnee()
+{
+    std::printf ("Micro Glow below the knee: the oversampling is linear-phase and flat (null vs the delayed input)\n");
+    for (double sr : { 44100.0, 48000.0, 96000.0 })
+    {
+        const size_t n = (size_t) sr;
+        Buf in = makeBuf (1, n);
+        const double freqs[] = { 40, 100, 440, 1000, 3000, 8000, 12000, 16000, 18000 };
+        for (size_t i = 0; i < n; ++i)
+            for (double f : freqs) in[0][i] += 0.003f * (float) std::sin (2 * M_PI * f * (double) i / sr + f);
+        tg::GateSettings s = glowSettings (tg::MicroGlow::clip, 0.0f, 0.0f);   // -50 dBFS per tone: nowhere near the knee
+        tg::GateEngine e;
+        Buf out = run (in, s, sr, 0, nullptr, 1, &e);
+        const size_t L = (size_t) e.currentLatency();
+        double num = 0, den = 0;
+        for (size_t i = (size_t) sr / 4; i < n; ++i) { const double d = out[0][i] - in[0][i - L]; num += d * d; den += (double) in[0][i - L] * in[0][i - L]; }
+        const double nullDb = 10 * std::log10 (num / den);
+        std::printf ("  %.0f kHz: null %.1f dB (40 Hz - 18 kHz, %dx oversampling)\n", sr / 1000, nullDb, sr < 60000 ? 8 : 4);
+        CHECK (nullDb < -70.0, "sr %.0f null only %.1f dB", sr, nullDb);
+    }
+}
+
+static void testGlowSmallSignalAndCeiling()
+{
+    std::printf ("Micro Glow: unity below the knee for every type; peaks held at the Ceiling\n");
+    const double sr = 48000;
+    const size_t n = 48000;
+    const char* names[] = { "TUBE", "DIODE", "CLIP" };
+    for (int t = 0; t < 3; ++t)
+    {
+        Buf quiet = makeBuf (1, n), loud = makeBuf (1, n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            quiet[0][i] = 0.01f * (float) std::sin (2 * M_PI * 1000 * i / sr);   // -40 dBFS
+            loud[0][i]  = 0.5f  * (float) std::sin (2 * M_PI * 100 * i / sr);    // -6 dBFS, +12 dB drive -> 12 dB over a -6 dB ceiling
+        }
+        Buf q = run (quiet, glowSettings (t, 0.0f, 0.0f), sr, 0);
+        const double qDb = goertzelDb (q[0], 8000, 32768, 1000, sr) - goertzelDb (quiet[0], 8000, 32768, 1000, sr);
+        Buf l = run (loud, glowSettings (t, 12.0f, -6.0f), sr, 0);
+        const float pk = peakDbIn (l[0], 8000, n);
+        std::printf ("  %-5s: -40 dBFS tone %+.4f dB; hard-driven peak %.2f dBFS (ceiling -6.00)\n", names[t], qDb, pk);
+        CHECK (std::abs (qDb) < 0.01, "%s small-signal gain %.4f dB", names[t], qDb);
+        CHECK (pk <= -6.0f + 0.8f && pk > -6.0f - 1.5f, "%s peak %.2f dBFS vs ceiling -6", names[t], pk);
+    }
+}
+
+static void testGlowHarmonics()
+{
+    std::printf ("Micro Glow harmonics: TUBE/DIODE add 2nd harmonic, CLIP is odd-only\n");
+    const double sr = 48000;
+    const size_t n = 65536;
+    Buf in = makeBuf (1, n);
+    for (size_t i = 0; i < n; ++i) in[0][i] = 0.5f * (float) std::sin (2 * M_PI * 187.5 * i / sr);
+    const char* names[] = { "TUBE", "DIODE", "CLIP" };
+    for (int t = 0; t < 3; ++t)
+    {
+        Buf o = run (in, glowSettings (t, 9.0f, -3.0f), sr, 0);
+        const double h1 = goertzelDb (o[0], 16384, 32768, 187.5, sr);
+        const double h2 = goertzelDb (o[0], 16384, 32768, 375.0, sr) - h1;
+        const double h3 = goertzelDb (o[0], 16384, 32768, 562.5, sr) - h1;
+        std::printf ("  %-5s: 2nd %.1f dBc, 3rd %.1f dBc\n", names[t], h2, h3);
+        if (t == tg::MicroGlow::clip) CHECK (h2 < -90.0, "CLIP made 2nd harmonic at %.1f dBc", h2);
+        else                          CHECK (h2 > -60.0, "%s 2nd harmonic only %.1f dBc", names[t], h2);
+        CHECK (h3 > -40.0, "%s 3rd harmonic only %.1f dBc", names[t], h3);
+    }
+}
+
+static void testGlowAliasing()
+{
+    std::printf ("Micro Glow aliasing, 18 dB into a -6 dBFS ceiling (tones that don't divide 48 kHz, so aliases can't hide on harmonics)\n");
+    const double sr = 48000;
+    const size_t n = 65536;
+    const char* names[] = { "TUBE", "DIODE", "CLIP" };
+    auto worstAlias = [&] (const std::vector<float>& x, double f0)
+    {
+        const double ref = goertzelDb (x, 16384, 32768, f0, sr);
+        double w = -300;
+        for (double f = 100; f < 20000; f += 13)
+        {
+            const double r = std::fmod (f, f0);
+            if (r < 40 || r > f0 - 40) continue;   // skip the harmonics themselves
+            w = std::max (w, goertzelDb (x, 16384, 32768, f, sr) - ref);
+        }
+        return w;
+    };
+    tg::MicroGlow mg; mg.prepare (sr, 1);
+    for (double f0 : { 2113.0, 6997.0 })
+    {
+        Buf in = makeBuf (1, n);
+        for (size_t i = 0; i < n; ++i) in[0][i] = 0.5f * (float) std::sin (2 * M_PI * f0 * (double) i / sr);
+        for (int t = 0; t < 3; ++t)
+        {
+            Buf o = run (in, glowSettings (t, 18.0f, -6.0f), sr, 0);
+            std::vector<float> naive (n);   // the same curve straight at 48 kHz
+            for (size_t i = 0; i < n; ++i) naive[i] = mg.curve (t, in[0][i] * dbToLin (18.0f), dbToLin (-6.0f));
+            const double ours = worstAlias (o[0], f0), raw = worstAlias (naive, f0);
+            std::printf ("  %-5s %4.0f Hz: worst alias %6.1f dBc (no oversampling: %5.1f dBc)\n", names[t], f0, ours, raw);
+            if (f0 < 3000) CHECK (ours < -90.0, "%s %.0f Hz alias %.1f dBc", names[t], f0, ours);
+            CHECK (ours < raw - 30.0, "%s %.0f Hz: oversampling only gained %.1f dB", names[t], f0, raw - ours);
+        }
+    }
+}
+
+static void testGlowSwitchingClickFree()
+{
+    std::printf ("Micro Glow: On/Off and type changes crossfade (no clicks)\n");
+    const double sr = 48000;
+    const size_t n = (size_t) sr * 2;
+    std::vector<float> x (n);
+    for (size_t i = 0; i < n; ++i) x[i] = 0.7f * (float) std::sin (2 * M_PI * 100 * i / sr);
+    tg::GateSettings s = glowSettings (tg::MicroGlow::clip, 12.0f, -6.0f);
+    tg::GateEngine e; e.prepare (sr, 1); e.setSettings (s); e.reset();
+    double worst = 0; float prev = 0;
+    for (size_t pos = 0; pos < n; pos += 128)
+    {
+        const size_t step = pos / 4800;   // every 100 ms
+        s.glow.on = (step % 3) != 0;
+        s.glow.type = (int) ((step / 2) % 3);
+        e.setSettings (s);
+        float* p = x.data() + pos;
+        e.process (&p, 1, nullptr, 0, 128);
+        tg::MeterFrame f; while (e.meters.pop (f)) {}
+        for (int i = 0; i < 128; ++i) { if (pos + (size_t) i > 0) worst = std::max (worst, (double) std::abs (p[i] - prev)); prev = p[i]; }
+    }
+    // dry 0.7 vs clipped ~0.5: at most ~1.2 apart over a 240-sample crossfade, plus the waveforms' own slope
+    const double bound = 1.2 / 240.0 + 0.7 * 2 * M_PI * 100 / sr * 4.0 * 1.6;
+    std::printf ("  worst jump %.4f (bound %.4f)\n", worst, bound);
+    CHECK (worst <= bound, "jump %.4f", worst);
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);
@@ -420,6 +792,17 @@ int main()
     testHitsAndExternalKey();
     testBypassKeepsLatency();
     testListenAndStability();
+    testLevelerFixedTarget();
+    testLevelerAuto();
+    testLevelerTransientUntouched();
+    testLevelerRolls();
+    testLevelerNoLookahead();
+    testLevelerClickFreeAndOff();
+    testGlowTransparentBelowKnee();
+    testGlowSmallSignalAndCeiling();
+    testGlowHarmonics();
+    testGlowAliasing();
+    testGlowSwitchingClickFree();
     std::printf ("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILED", gFailures);
     return gFailures == 0 ? 0 : 1;
 }

@@ -15,10 +15,12 @@ namespace tg
 struct Hit
 {
     // Filled in by the gate core (Phase 1)
-    uint64_t timeSamples   = 0;     // where the hit lands on the OUTPUT timeline (already includes the lookahead)
+    uint64_t timeSamples   = 0;     // where the hit lands on the OUTPUT timeline (includes the full latency)
     uint64_t arrivalSample = 0;     // when the key first crossed the open threshold, on the input timeline
                                     // (the original arrival time - alignment must never overwrite this)
     float    peakDb        = -120.0f; // key peak over the first 10 ms of the hit (the hit's "velocity")
+    float    audioPeakDb   = -120.0f; // audio peak measured before the hit reached the output (Phase 2)
+    float    levelChangeDb = 0.0f;    // what the leveler did to this hit (Phase 2)
 
     // Filled in by later phases (defaults mean "not known yet")
     float    pitchHz       = 0.0f;  // Phase 4: fundamental at the strike

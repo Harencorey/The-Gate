@@ -54,7 +54,9 @@ private:
     struct Raw
     {
         std::atomic<float>* threshold {}, * hysteresis {}, * attack {}, * hold {}, * release {}, * range {},
-                          * lookahead {}, * keySource {}, * keyHpf {}, * keyHighCut {}, * tracking {}, * listen {};
+                          * lookahead {}, * keySource {}, * keyHpf {}, * keyHighCut {}, * tracking {}, * listen {},
+                          * levelerOn {}, * levelAmount {}, * levelTarget {}, * levelMax {},
+                          * glowOn {}, * glowType {}, * glowDrive {}, * glowCeiling {};
     } raw;
 
     double currentRate = 0.0;

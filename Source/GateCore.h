@@ -1,6 +1,6 @@
 #pragma once
 //==============================================================================
-// The Gate - core gate engine (Phase 1). Plain C++, no JUCE, so the offline
+// The Gate - core gate engine (Phases 1-2). Plain C++, no JUCE, so the offline
 // tests run the exact code the plug-in runs.
 //
 // Signal flow:
@@ -10,7 +10,17 @@
 //        hysteresis -> state delay (so the attack ramp ends exactly on the transient)
 //        -> gain envelope (attack / hold / release / range)
 //
-//   audio -> lookahead delay -> x gain -> out          (Listen: the filtered key instead)
+//   audio -> lookahead delay -> x gate gain x leveler gain -> Micro Glow -> out
+//                                                    (Listen: the filtered key, Micro Glow skipped)
+//
+// Hits: a hit starts when the gate opens, or - while it's open - when the key jumps 6 dB up
+// from where it had decayed to (a new stroke in a roll, a flam). Every hit gets a Hit record.
+//
+// Leveler: each hit's audio peak is measured during the lookahead, before the hit reaches
+// the output, and a gain for that hit is set so the hit lands nearer the target. The gain
+// glides into place just BEFORE the hit's first sample and holds through its whole decay,
+// so the transient itself is never ramped. Needs lookahead; with Lookahead Off it measures
+// the first 1 ms and glides over the next 1 ms (the attack gets shaped a little).
 //
 // Real-time safety: prepare() allocates; process() never allocates, locks or blocks.
 // Block-size independence: everything runs per sample, and filter coefficients update
@@ -19,6 +29,7 @@
 
 #include "HitRecord.h"
 #include "SpscFifo.h"
+#include "MicroGlow.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,6 +54,17 @@ struct GateSettings
     float trackingPct  = 0.0f;     // 0..100: how far the high cut closes as each hit decays
     bool  externalKey  = false;    // key from the sidechain input
     bool  listen       = false;    // output the filtered key (what the detector hears)
+
+    // Leveler
+    bool  levelerOn    = false;
+    float levelAmount  = 75.0f;    // 0..100 %: how much of the gap to the target each hit closes
+    float levelTarget  = kAutoTarget; // dBFS, or kAutoTarget = the running average of recent hits
+    float levelMaxDb   = 12.0f;    // the most any hit is turned up or down
+
+    // Micro Glow
+    MicroGlow::Settings glow;
+
+    static constexpr float kAutoTarget = -100.0f;
 };
 
 // One display frame per kFrameSamples of output, for the UI's scrolling view.
@@ -51,7 +73,10 @@ struct MeterFrame
     float inPeak  = 0.0f;   // input audio peak (aligned with the output)
     float keyDb   = -120.0f;// detector level (aligned with the output)
     float gainDb  = 0.0f;   // gate gain (0 = open)
+    float levelDb = 0.0f;   // leveler gain
     bool  open    = false;  // detector state at this point
+    bool  hit     = false;  // a hit's first sample is in this frame
+    float hitChangeDb = 0.0f; // the leveler change for that hit
 };
 
 //------------------------------------------------------------------------------
@@ -100,7 +125,7 @@ public:
     void prepare (double sampleRate, int maxChannels)
     {
         sr = sampleRate;
-        numCh = std::max (1, maxChannels);
+        numCh = std::clamp (maxChannels, 1, kMaxChannels);
         const size_t maxLa = (size_t) std::ceil (kMaxLookaheadMs * 0.001 * sr) + 1;
         ringSize = 1;
         while (ringSize < maxLa + 2) ringSize <<= 1;
@@ -109,6 +134,7 @@ public:
         keyRing.assign (ringSize, 0.0f);
         levelRing.assign (ringSize, 0.0f);
         stateRing.assign (ringSize, 0);
+        glow.prepare (sr, numCh);
         reset();
     }
 
@@ -124,8 +150,6 @@ public:
         peakEnv = rmsPow = 0.0;
         trackFast = trackSlow = trackPeak = 0.0;
         detectorOpen = false;
-        hitWindow = 0;
-        hitPeak = 0.0;
         g = gFloor = gFloorTarget = dbToGain (s.rangeDb);
         attacking = false;
         holdLeft = 0;
@@ -136,6 +160,18 @@ public:
         hcStartSm = highCutStart();
         frameCount = 0;
         frame = {};
+        onsetPeak = onsetValley = 0.0;
+        lastOnset = riseStart = 0;
+        prevKf = slopeEnv = prevSlopeEnv = 0.0;
+        haveOnset = false;
+        numPending = 0;
+        lvlGain = lvlFrom = lvlTo = 1.0;
+        lvlGlideLeft = 0;
+        lvlUser = 1.0;
+        lvlAvgDb = 0.0;
+        lvlHaveAvg = false;
+        lvlMarkAt = UINT64_MAX;
+        glow.reset();
         // (the FIFOs are drained by their consumer; clearing them here would race the UI thread)
         retune();
         // settle the smoothers so a fresh start is exact
@@ -156,13 +192,17 @@ public:
         releaseCoef = std::pow (10.0, -span / (20.0 * relSamples));
         gFloorTarget = dbToGain (s.rangeDb);
         laTarget = lookaheadSamples (s.lookaheadMs);
+        glow.setSettings (s.glow);
     }
 
     int lookaheadSamples (float ms) const noexcept
     {
         return (int) std::lround (std::clamp ((double) ms, 0.0, kMaxLookaheadMs) * 0.001 * sr);
     }
-    int currentLatency() const noexcept { return la; }
+    // total latency = lookahead + Micro Glow's oversampling filters (constant, on or off)
+    int currentLatency() const noexcept { return la + glow.latencySamples(); }
+    int latencyFor (float lookaheadMs) const noexcept { return lookaheadSamples (lookaheadMs) + glow.latencySamples(); }
+    int glowLatency() const noexcept { return glow.latencySamples(); }
 
     //--------------------------------------------------------------------------
     // io: numChannels audio buffers, processed in place.
@@ -177,6 +217,16 @@ public:
         const double fastRel  = std::exp (-1.0 / (0.005 * sr));
         const double slowCoef = std::exp (-1.0 / (0.005 * sr));
         const int hitWindowSamples = std::max (1, (int) std::lround (0.010 * sr));
+        const uint64_t minGap = (uint64_t) std::lround (0.015 * sr);
+        const uint64_t maxBackdate = (uint64_t) std::lround (0.003 * sr);
+        const double slopeRel = std::exp (-1.0 / (0.005 * sr));
+        const int oneMs = std::max (1, (int) std::lround (0.001 * sr));
+        // Leveler timing (see the header): measure for W samples, glide for G, finish P before the hit
+        const int G = la > 0 ? std::clamp (la / 4, 1, oneMs) : oneMs;
+        const int P = la > 0 ? std::min (oneMs / 2, la / 8) : 0;
+        const int W = la > 0 ? std::max (1, la - G - P) : oneMs;
+        const double lvlStepOff = 1.0 / std::max (1.0, 0.010 * sr);   // 10 ms on/off glide
+        float glowFrame[kMaxChannels];
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -233,22 +283,81 @@ public:
             if (! detectorOpen && level >= thrOpen)       detectorOpen = true;
             else if (detectorOpen && level < thrClose)    detectorOpen = false;
 
-            if (detectorOpen && ! wasOpen)
+            //---------------- onsets: the gate opening, or a fresh stroke while it's open
+            // Strokes are found on the key's slope (its first difference: "high-frequency
+            // content"), not its level. A stick attack is a sharp broadband edge; the ringing tail
+            // of the last hit is smooth, so even a ghost note 9 dB over a tom's tail stands out
+            // clearly and gets timed to the sample. riseStart = the last sample before the slope
+            // envelope started climbing: where the stroke really begins.
             {
-                hitWindow = hitWindowSamples;
-                hitPeak = 0.0;
-                pendingHit = {};
-                pendingHit.arrivalSample = clock;
-                pendingHit.timeSamples = clock + (uint64_t) la;
+                const double d = std::abs (kf - prevKf);
+                prevKf = kf;
+                slopeEnv = d > slopeEnv ? d : d + (slopeEnv - d) * slopeRel;
             }
-            if (hitWindow > 0)
+            if (slopeEnv <= prevSlopeEnv) riseStart = clock;
+            prevSlopeEnv = slopeEnv;
+            bool onset = detectorOpen && ! wasOpen;
+            if (detectorOpen && wasOpen)
             {
-                hitPeak = std::max (hitPeak, level);
-                if (--hitWindow == 0)
+                // test against the valley/peak so far, THEN update them (a stroke louder than the
+                // last one would otherwise reset the valley before its own jump is seen)
+                if (slopeEnv > 4.0 * onsetValley && onsetValley < 0.25 * onsetPeak
+                    && (! haveOnset || clock - lastOnset >= minGap))
+                    onset = true;
+                if (slopeEnv > onsetPeak)          { onsetPeak = slopeEnv; onsetValley = slopeEnv; }
+                else if (slopeEnv < onsetValley)   onsetValley = slopeEnv;
+            }
+            if (onset)
+            {
+                onsetPeak = onsetValley = slopeEnv;
+                // backdate to where the rise began (at most 3 ms, and never before the last hit)
+                uint64_t t0 = std::max (riseStart + 1 <= clock ? riseStart + 1 : clock, clock >= maxBackdate ? clock - maxBackdate : 0);
+                if (haveOnset) t0 = std::max (t0, lastOnset + 1);
+                lastOnset = t0;
+                haveOnset = true;
+                if (numPending < kMaxPending)
                 {
-                    pendingHit.peakDb = (float) gainToDb (hitPeak);
-                    hits.push (pendingHit);
+                    auto& pd = pending[numPending++];
+                    pd = {};
+                    pd.hit.arrivalSample = t0;
+                    pd.hit.timeSamples = t0 + (uint64_t) la + (uint64_t) glow.latencySamples();
+                    pd.start = t0;
+                    pd.decideAt = t0 + (uint64_t) W;
+                    pd.reportAt = t0 + (uint64_t) std::max (W, hitWindowSamples);
+                    pd.landsAt = t0 + (uint64_t) la;
+                    // the samples from t0 up to now are already in the delay line
+                    for (uint64_t c0 = t0; c0 < clock; ++c0)
+                    {
+                        const size_t r = (writePos + ringSize - (size_t) (clock - c0)) & ringMask;
+                        for (int c = 0; c < numChannels; ++c)
+                            pd.audioPeak = std::max (pd.audioPeak, (double) std::abs (audioRing[(size_t) c * ringSize + r]));
+                        pd.keyPeak = std::max (pd.keyPeak, (double) levelRing[r]);
+                    }
                 }
+            }
+
+            //---------------- pending hits: measure, then decide the leveler gain, then report
+            for (int h = 0; h < numPending;)
+            {
+                auto& pd = pending[h];
+                if (clock < pd.start + (uint64_t) hitWindowSamples) pd.keyPeak = std::max (pd.keyPeak, level);
+                if (! pd.decided)
+                {
+                    for (int c = 0; c < numChannels; ++c) pd.audioPeak = std::max (pd.audioPeak, (double) std::abs (io[c][i]));
+                    if (clock + 1 >= pd.decideAt)
+                    {
+                        pd.decided = true;
+                        decideLevel (pd, G);
+                    }
+                }
+                if (pd.decided && clock + 1 >= pd.reportAt)
+                {
+                    pd.hit.peakDb = (float) gainToDb (pd.keyPeak);
+                    hits.push (pd.hit);
+                    pending[h] = pending[--numPending];
+                    continue;
+                }
+                ++h;
             }
 
             //---------------- delay lines
@@ -307,21 +416,35 @@ public:
             }
             else laFadeGain = 1.0f;
 
+            //---------------- leveler gain: hit gain (scheduled by decideLevel) x on/off glide
+            if (lvlGlideLeft > 0)
+            {
+                --lvlGlideLeft;
+                lvlGain = lvlGlideLeft == 0 ? lvlTo : lvlTo + (lvlFrom - lvlTo) * (double) lvlGlideLeft / (double) lvlGlideLen;
+            }
+            const double userT = s.levelerOn ? 1.0 : 0.0;
+            if (lvlUser < userT)      lvlUser = std::min (userT, lvlUser + lvlStepOff);
+            else if (lvlUser > userT) lvlUser = std::max (userT, lvlUser - lvlStepOff);
+            const double lg = lvlUser >= 1.0 ? lvlGain : (lvlUser <= 0.0 ? 1.0 : 1.0 + lvlUser * (lvlGain - 1.0));
+
             //---------------- output
             const float gf = (float) g * laFadeGain;
+            const float lf = (float) lg;
             if (s.listen)
             {
                 const float kOut = keyRing[rAudio] * laFadeGain;
-                for (int c = 0; c < numChannels; ++c) io[c][i] = kOut;
+                for (int c = 0; c < numChannels; ++c) glowFrame[c] = kOut;
             }
             else
             {
                 for (int c = 0; c < numChannels; ++c)
                 {
                     const float x = audioRing[(size_t) c * ringSize + rAudio];
-                    io[c][i] = x * gf;   // x * 1.0f is exact: bit-identical when fully open
+                    glowFrame[c] = (x * gf) * lf;   // x * 1.0f is exact: bit-identical when fully open
                 }
             }
+            glow.tick (glowFrame, numChannels, s.listen);
+            for (int c = 0; c < numChannels; ++c) io[c][i] = glowFrame[c];
 
             //---------------- meters (aligned with the output)
             float inPk = 0.0f;
@@ -329,7 +452,9 @@ public:
             frame.inPeak = std::max (frame.inPeak, inPk);
             frame.keyDb  = std::max (frame.keyDb, (float) gainToDb (levelRing[rAudio]));
             frame.gainDb = std::min (frame.gainDb, (float) gainToDb (g));
+            frame.levelDb = (float) gainToDb (lg);
             frame.open   = frame.open || stateRing[rAudio] != 0;
+            if (clock == lvlMarkAt) { frame.hit = true; frame.hitChangeDb = lvlMarkDb; }
             if (++frameCount == kFrameSamples)
             {
                 meters.push (frame);
@@ -343,19 +468,25 @@ public:
     }
 
     // Bypass keeps the same latency, so toggling it never shifts the track in time.
+    // (Micro Glow is forced to its dry path, which is the matching pure delay.)
     void processBypassed (float* const* io, int numChannels, int numSamples) noexcept
     {
         numChannels = std::min (numChannels, numCh);
+        float fr[kMaxChannels];
         for (int i = 0; i < numSamples; ++i)
         {
             const size_t w = writePos;
             for (int c = 0; c < numChannels; ++c) audioRing[(size_t) c * ringSize + w] = io[c][i];
             const size_t r = (w + ringSize - (size_t) la) & ringMask;
-            for (int c = 0; c < numChannels; ++c) io[c][i] = audioRing[(size_t) c * ringSize + r];
+            for (int c = 0; c < numChannels; ++c) fr[c] = audioRing[(size_t) c * ringSize + r];
+            glow.tick (fr, numChannels, true);
+            for (int c = 0; c < numChannels; ++c) io[c][i] = fr[c];
             writePos = (w + 1) & ringMask;
             ++clock;
         }
     }
+
+    static constexpr int kMaxChannels = 8;
 
     SpscFifo<MeterFrame, 1024> meters;   // audio -> UI
     SpscFifo<Hit, 256>         hits;     // audio -> UI / later phases
@@ -363,12 +494,43 @@ public:
     // read-only access for tests
     double currentGain() const noexcept { return g; }
     double currentHighCutHz() const noexcept { return lpfOn ? hcNow : 0.0; }
+    double currentLevelerGain() const noexcept { return lvlGain; }
 
 private:
     static double dbToGain (double db) noexcept { return db <= kFullyShutDb ? 0.0 : std::pow (10.0, db / 20.0); }
     static double gainToDb (double gn) noexcept { return gn <= 1e-6 ? -120.0 : 20.0 * std::log10 (gn); }
 
     double highCutStart() const noexcept { return s.keyHighCutHz > 0 ? s.keyHighCutHz : 20000.0; }
+
+    struct Pending
+    {
+        Hit hit;
+        uint64_t start = 0, decideAt = 0, reportAt = 0, landsAt = 0;
+        double keyPeak = 0.0, audioPeak = 0.0;
+        bool decided = false;
+    };
+
+    // Sets this hit's leveler gain; it glides in over G samples and is fully there P samples
+    // before the hit's first sample comes out (landsAt).
+    void decideLevel (Pending& pd, int G) noexcept
+    {
+        const double peakDb = gainToDb (std::max (pd.audioPeak, 1e-6));
+        pd.hit.audioPeakDb = (float) peakDb;
+        const bool autoT = s.levelTarget <= GateSettings::kAutoTarget + 1.0f;
+        const double target = autoT ? (lvlHaveAvg ? lvlAvgDb : peakDb) : (double) s.levelTarget;
+        const double maxDb = std::clamp ((double) s.levelMaxDb, 0.0, 48.0);
+        const double changeDb = std::clamp ((s.levelAmount * 0.01) * (target - peakDb), -maxDb, maxDb);
+        // the running average of hit peaks (what Auto aims at), ~8 hits long
+        lvlAvgDb = lvlHaveAvg ? lvlAvgDb + (peakDb - lvlAvgDb) / 8.0 : peakDb;
+        lvlHaveAvg = true;
+
+        pd.hit.levelChangeDb = s.levelerOn ? (float) changeDb : 0.0f;
+        lvlFrom = lvlGain;
+        lvlTo = std::pow (10.0, changeDb / 20.0);
+        lvlGlideLen = lvlGlideLeft = std::max (1, G);
+        lvlMarkAt = pd.landsAt;
+        lvlMarkDb = pd.hit.levelChangeDb;
+    }
 
     // Runs every kCoeffEvery samples, on a grid counted from reset().
     void retune() noexcept
@@ -427,9 +589,23 @@ private:
     double thrOpen = 0.03, thrClose = 0.015;
     bool detectorOpen = false;
 
-    int hitWindow = 0;
-    double hitPeak = 0.0;
-    Hit pendingHit;
+    // onsets and pending hits
+    static constexpr int kMaxPending = 8;
+    Pending pending[kMaxPending];
+    int numPending = 0;
+    double onsetPeak = 0.0, onsetValley = 0.0;
+    uint64_t lastOnset = 0, riseStart = 0;
+    double prevKf = 0.0, slopeEnv = 0.0, prevSlopeEnv = 0.0;
+    bool haveOnset = false;
+
+    // leveler
+    double lvlGain = 1.0, lvlFrom = 1.0, lvlTo = 1.0, lvlUser = 1.0, lvlAvgDb = 0.0;
+    int lvlGlideLeft = 0, lvlGlideLen = 1;
+    bool lvlHaveAvg = false;
+    uint64_t lvlMarkAt = UINT64_MAX;
+    float lvlMarkDb = 0.0f;
+
+    MicroGlow glow;
 
     double g = 0.0, gFloor = 0.0, gFloorTarget = 0.0, floorCoef = 0.0;
     double attackSamples = 24.0, attackFrom = 0.0, attackPhase = 0.0, releaseCoef = 0.999;

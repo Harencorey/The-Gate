@@ -65,12 +65,13 @@ private:
     GateDisplay display;
 
     Knob threshold, hysteresis, attack, hold, release, range, keyHpf, keyHighCut, tracking;
-    Choice lookahead, keySource;
-    juce::TextButton listen { "LISTEN KEY" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> listenAtt;
+    Knob levelAmount, levelTarget, levelMax, glowDrive, glowCeiling;
+    Choice lookahead, keySource, glowType;
+    juce::TextButton listen { "LISTEN KEY" }, levelerOn { "ON" }, glowOn { "ON" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> listenAtt, levelerOnAtt, glowOnAtt;
     juce::TooltipWindow tooltips { this, 3000 };
 
-    juce::Rectangle<int> detectArea, envArea, keyArea;
+    juce::Rectangle<int> detectArea, envArea, keyArea, levelArea, glowArea;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TheGateEditor)
 };

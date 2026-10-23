@@ -31,7 +31,7 @@ jobs:
       - name: Build
         run: cmake --build build-mac --config Release --target TheGate_AU TheGate_VST3 TheGate_Standalone GateTests GateProcessorTests -j "$(sysctl -n hw.ncpu)"
 
-      - name: Engine tests (latency, clicks, hold/release/range, block-size independence, no audio-thread allocations)
+      - name: Engine tests (gate, leveler, Micro Glow - latency, clicks, levels, aliasing, block-size independence, no audio-thread allocations)
         run: bash .github/run_test.sh ./build-mac/GateTests
 
       - name: Plug-in tests (bus layouts, sidechain, reported latency, bypass, session save/load)
