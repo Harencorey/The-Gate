@@ -1,0 +1,5 @@
+__pycache__/
+*.wav
+*.aif*
+*.npz
+labels/
