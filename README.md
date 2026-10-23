@@ -58,18 +58,18 @@ into the hit (so the attack is shaped a little).
 
 ### Micro Glow (on/off)
 
-A saturator/clipper at the very end, after the gate and leveler, built from Glow's own curves.
+Glow's saturation at the very end, after the gate and leveler: one knob and a type.
 Oversampled to ~384 kHz like Glow (8x at 44.1/48k) with **linear-phase** filters and no DC blocker, so it
-adds **no phase shift at all**, important in a plug-in that keeps mics phase-aligned. Every curve has
-unity gain for small signals: nothing is colored until peaks reach the ceiling.
+adds **no phase shift** below the curve, important in a plug-in that keeps mics phase-aligned.
+The output is **loudness-matched** like Glow's Auto Gain: Drive changes the color and density, not the level.
 
 | Control | What it does |
 |---|---|
-| **Type** | **Tube**: Glow's tube output stage (soft, a little 2nd harmonic). **Diode**: Glow's diode (softer knee, more 2nd). **Clip**: near-hard and symmetric, odd harmonics only: shaves peaks flat. |
-| **Drive** | Gain into Micro Glow (0 to +24 dB). Below the ceiling it's just level. |
-| **Ceiling** | The level peaks can't pass (−24 to 0 dBFS). |
+| **Type** | **Tube**: Glow's tube output stage. The whole sound thickens, softer and rounder as Drive goes up (a little 2nd harmonic from Glow's measured asymmetry). **Iron**: Glow's transformer core. Only the lows (below ~126 Hz) saturate and compress; mids and highs pass clean. |
+| **Drive** (center knob) | How hard it's hit, on Glow's Drive scale (0–100, default 25). Tube follows Glow's measured Drive map exactly. Iron's knob covers Glow's Drive 0–45: its harmonics peak about 10 dB into the core, and past that the lows just drop out, so the whole knob stays on the useful side. Double-click: 25. |
+| **Env** (outer ring) | Glow's envelope follower, at Glow's default speed: hits that rise above the track's own ~3 s average push Drive up (right of center) or pull it back (left), 4 Drive units per dB at 100 %, always returning to exactly the knob setting. A violet dot on the knob shows where Drive is right now. Double-click: off. |
 
-On/Off and Type changes crossfade (5 / 10 ms). Off is bit-exact.
+On/Off and Type changes crossfade (5 / 10 ms). Off is bit-exact. The 1 ms of latency is there on or off.
 
 **How the detector works:** the key is summed to mono, filtered, and measured with a blend of a peak follower
 (10 ms release) and a 3 ms RMS. Every hit is logged with its arrival time and level; later phases fill in pitch,
@@ -83,11 +83,12 @@ Phase 2:
 - The leveler gain is constant from the hit's first sample through its first 20 ms (2, 5, 10, 20 ms lookahead): no ramp on the transient.
 - A 16-stroke roll (40 ms apart, 13 dB loud/soft): 16 hits found, leveled strokes within 0.00 dB of each other.
 - Leveler gain changes and On/Off toggling: click-free. Leveler Off is bit-identical.
-- Micro Glow below the knee nulls against the delayed input at −78 dB (40 Hz–18 kHz, 44.1/48/96 kHz): linear-phase, flat.
-- Unity small-signal gain (±0.001 dB) for every type; driven 12 dB over, peaks land at the ceiling (−6.00 dBFS).
-- Clip is odd-only (2nd harmonic −196 dBc); Tube −47 dBc and Diode −30 dBc of 2nd.
-- Aliasing, 18 dB into the ceiling: 2.1 kHz tone −92 to −123 dBc (vs −45 to −48 dBc without oversampling); a 7 kHz tone −55 to −72 dBc (vs −23).
-- On/Off and type switching: click-free. CPU: ~2.5 % of one core per stereo instance at 48 kHz with everything on.
+- Micro Glow below the curve nulls against the delayed input at −74 dB (Tube) / −78 dB (Iron), 40 Hz–18 kHz, 44.1/48/96 kHz.
+- Drive 0 → 100 on a −6 dBFS tone: Tube THD −48 → −8 dB, Iron −35 → −18 dB, rising at every step; level held within 0.00 dB by the auto gain.
+- Iron at Drive 75: 60 Hz THD −18 dB, 2 kHz THD −77 dB (lows only). Both types make 2nd harmonic (−49 / −40 dBc).
+- Aliasing, −6 dBFS: Drive 50 −86 to −122 dBc (vs −35 to −55 with no oversampling); Drive 100 Tube −86 dBc at 2.1 kHz, −46 dBc on a pure 7 kHz tone; Iron −121 dBc everywhere.
+- Envelope at +100 % moves Drive 40 → up to 90 and back; at −100 % down to 0 and back; at 0 it never moves.
+- On/Off and Type switching: no step bigger than the signals' own steepness. CPU: ~2.5 % of one core per stereo instance at 48 kHz with everything on.
 
 Phase 1:
 
@@ -109,6 +110,13 @@ bash build_mac.sh                   # downloads JUCE 8.0.15 automatically
 Needs the Xcode command line tools and CMake (`brew install cmake`). Builds a universal **AU, VST3 and Standalone**,
 installs the plug-ins into `~/Library/Audio/Plug-Ins/`, and runs the tests. Logic: `auval -v aufx Gate Nrka`.
 
+## Branches
+
+Each phase is built on its own branch (`phase-2`, `phase-3`, ...) and merged into `main` when it's done;
+`phase-1` is a snapshot of where Phase 1 finished. Every branch push builds and validates on a Mac and
+publishes a **test build** (pre-release tagged `test-<branch>`) so it can be tried before merging.
+`main` publishes the official **latest** release and a permanent version release.
+
 ## Automated builds
 
 Every push to `main` builds on a GitHub macOS runner (`.github/workflows/build-mac.yml`), the same pipeline as Glow and
@@ -118,7 +126,7 @@ strictness 10, then the **latest** release plus a permanent version release with
 ## Files
 
 - `Source/GateCore.h`: the whole audio path (detector, filters, tracking, onsets, envelope, leveler, lookahead, meters). Plain C++, shared with the tests.
-- `Source/MicroGlow.h`: Micro Glow (Glow's curves, oversampling). `Source/HalfbandCoeffs.h` is generated by `tools/design_halfband.py`.
+- `Source/MicroGlow.h`: Micro Glow (Glow's Tube and Iron, envelope follower, auto gain, oversampling). `Source/GlowDriveMap.h` is Glow's Drive map, copied verbatim; `Source/HalfbandCoeffs.h` is generated by `tools/design_halfband.py`.
 - `Source/HitRecord.h`: the hit record every feature reads and writes.
 - `Source/SpscFifo.h`: lock-free audio → UI queue.
 - `Source/Params.h`: parameter IDs (don't rename after release: it breaks sessions).

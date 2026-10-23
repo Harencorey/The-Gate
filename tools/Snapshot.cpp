@@ -40,8 +40,8 @@ int main (int argc, char** argv)
     set (tg::pid::levelerOn, 1.0f);
     set (tg::pid::levelAmount, 80.0f);
     set (tg::pid::glowOn, 1.0f);
-    set (tg::pid::glowDrive, 4.0f);
-    set (tg::pid::glowCeiling, -3.0f);
+    set (tg::pid::glowDrive, 35.0f);
+    set (tg::pid::glowEnv, 60.0f);
     p.prepareToPlay (sr, 256);
 
     // 3 s: tom hits (loud and soft) with quieter snare bleed hits in between, plus a noise floor

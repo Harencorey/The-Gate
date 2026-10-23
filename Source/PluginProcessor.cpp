@@ -59,10 +59,12 @@ AudioProcessorValueTreeState::ParameterLayout TheGateProcessor::createLayout()
 
     // Micro Glow
     ps.push_back (std::make_unique<AudioParameterBool> (ParameterID { tg::pid::glowOn, 1 }, "Micro Glow", false));
-    ps.push_back (std::make_unique<AudioParameterChoice> (ParameterID { tg::pid::glowType, 1 }, "Glow Type", StringArray { "Tube", "Diode", "Clip" }, 0));
-    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::glowDrive, 1 }, "Glow Drive", NormalisableRange<float> (0.0f, 24.0f, 0.1f), 0.0f,
-                                       A().withLabel ("dB").withStringFromValueFunction ([] (float v, int) { return "+" + String (v, 1) + " dB"; })));
-    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::glowCeiling, 1 }, "Glow Ceiling", NormalisableRange<float> (-24.0f, 0.0f, 0.1f), 0.0f, dB));
+    ps.push_back (std::make_unique<AudioParameterChoice> (ParameterID { tg::pid::glowType, 1 }, "Glow Type", StringArray { "Tube", "Iron" }, 0));
+    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::glowDrive, 1 }, "Glow Drive", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 25.0f,
+                                       A().withStringFromValueFunction ([] (float v, int) { return String (v, 1); })));
+    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::glowEnv, 1 }, "Glow Envelope", NormalisableRange<float> (-100.0f, 100.0f, 0.1f), 0.0f,
+                                       A().withLabel ("%").withStringFromValueFunction ([] (float v, int)
+                                           { return (v > 0.05f ? "+" : "") + String (roundToInt (v)) + " %"; })));
     return { ps.begin(), ps.end() };
 }
 
@@ -93,7 +95,7 @@ TheGateProcessor::TheGateProcessor()
     raw.glowOn      = apvts.getRawParameterValue (tg::pid::glowOn);
     raw.glowType    = apvts.getRawParameterValue (tg::pid::glowType);
     raw.glowDrive   = apvts.getRawParameterValue (tg::pid::glowDrive);
-    raw.glowCeiling = apvts.getRawParameterValue (tg::pid::glowCeiling);
+    raw.glowEnv     = apvts.getRawParameterValue (tg::pid::glowEnv);
 
     engine.prepare (48000.0, 2);
     startTimerHz (10);
@@ -137,9 +139,9 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.levelTarget  = tgt <= tg::kTargetAutoDb + 0.05f ? tg::GateSettings::kAutoTarget : tgt;
     s.levelMaxDb   = raw.levelMax->load();
     s.glow.on        = raw.glowOn->load() > 0.5f;
-    s.glow.type      = jlimit (0, 2, (int) raw.glowType->load());
-    s.glow.driveDb   = raw.glowDrive->load();
-    s.glow.ceilingDb = raw.glowCeiling->load();
+    s.glow.type      = jlimit (0, 1, (int) raw.glowType->load());
+    s.glow.drive     = raw.glowDrive->load();
+    s.glow.envAmount = raw.glowEnv->load();
     return s;
 }
 

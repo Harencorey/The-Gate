@@ -39,12 +39,34 @@ TheGateLook::TheGateLook()
     setColour (TooltipWindow::outlineColourId, colours::edge);
 }
 
-void TheGateLook::drawRotarySlider (Graphics& g, int x, int y, int w, int h, float pos, float start, float end, Slider&)
+void TheGateLook::drawRotarySlider (Graphics& g, int x, int y, int w, int h, float pos, float start, float end, Slider& s)
 {
     const auto bounds = Rectangle<float> ((float) x, (float) y, (float) w, (float) h).reduced (4.0f);
     const float r = jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
     const auto c = bounds.getCentre();
     const float angle = start + pos * (end - start);
+
+    if (s.getProperties().contains ("ring"))
+    {
+        // bipolar ring (the concentric pot's outer control), drawn from 12 o'clock
+        const float rr = r - 2.0f, mid = 0.5f * (start + end);
+        Path track;
+        track.addCentredArc (c.x, c.y, rr, rr, 0.0f, start, end, true);
+        g.setColour (colours::edge);
+        g.strokePath (track, PathStrokeType (5.0f, PathStrokeType::curved, PathStrokeType::butt));
+        if (std::abs (angle - mid) > 0.01f)
+        {
+            Path value;
+            value.addCentredArc (c.x, c.y, rr, rr, 0.0f, jmin (mid, angle), jmax (mid, angle), true);
+            g.setColour (colours::level);
+            g.strokePath (value, PathStrokeType (5.0f, PathStrokeType::curved, PathStrokeType::butt));
+        }
+        g.setColour (colours::dim);
+        g.fillEllipse (Rectangle<float> (3.0f, 3.0f).withCentre (c.getPointOnCircumference (rr + 6.0f, mid)));   // centre tick
+        g.setColour (colours::text);
+        g.fillEllipse (Rectangle<float> (7.0f, 7.0f).withCentre (c.getPointOnCircumference (rr, angle)));
+        return;
+    }
 
     Path track;
     track.addCentredArc (c.x, c.y, r - 2, r - 2, 0.0f, start, end, true);
@@ -55,6 +77,16 @@ void TheGateLook::drawRotarySlider (Graphics& g, int x, int y, int w, int h, flo
     value.addCentredArc (c.x, c.y, r - 2, r - 2, 0.0f, start, angle, true);
     g.setColour (colours::accent);
     g.strokePath (value, PathStrokeType (3.0f, PathStrokeType::curved, PathStrokeType::rounded));
+
+    if (s.getProperties().contains ("mod"))   // live value incl. modulation, as a dot on the arc
+    {
+        const float mp = jlimit (0.0f, 1.0f, (float) s.getProperties()["mod"]);
+        if (std::abs (mp - pos) > 0.004f)
+        {
+            g.setColour (colours::level);
+            g.fillEllipse (Rectangle<float> (6.0f, 6.0f).withCentre (c.getPointOnCircumference (r - 2, start + mp * (end - start))));
+        }
+    }
 
     g.setColour (colours::panel.brighter (0.08f));
     g.fillEllipse (c.x - (r - 7), c.y - (r - 7), 2 * (r - 7), 2 * (r - 7));
@@ -187,8 +219,80 @@ void GateDisplay::paint (Graphics& g)
 }
 
 //==============================================================================
+ConcentricKnob::ConcentricKnob (AudioProcessorValueTreeState& apvts, const char* knobId, const char* ringId,
+                                const String& kn, const String& rn, const String& knobTip, const String& ringTip)
+    : knobName (kn), ringName (rn)
+{
+    for (Slider* s : { (Slider*) &ring, &knob })
+    {
+        s->setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
+        s->setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+        s->setPopupDisplayEnabled (false, false, nullptr);
+        addAndMakeVisible (*s);
+    }
+    ring.getProperties().set ("ring", true);
+    ring.setTooltip (ringTip);
+    knob.setTooltip (knobTip);
+    knobAtt = std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (apvts, knobId, knob);
+    ringAtt = std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (apvts, ringId, ring);
+    ring.setDoubleClickReturnValue (true, 0.0);
+    knob.setDoubleClickReturnValue (true, 25.0);
+    ring.onValueChange = [this] { repaint(); };
+    knob.onValueChange = [this] { repaint(); };
+}
+
+bool ConcentricKnob::RingSlider::hitTest (int x, int y)
+{
+    const auto b = getLocalBounds().toFloat();
+    const float d = b.getCentre().getDistanceFrom ({ (float) x, (float) y });
+    const float r = jmin (b.getWidth(), b.getHeight()) * 0.5f;
+    return d <= r && d >= r - 12.0f;   // just the ring
+}
+
+void ConcentricKnob::setModulated (float v)
+{
+    const auto prev = (float) knob.getProperties()["mod"];
+    const float p = (float) knob.valueToProportionOfLength (v);
+    if (std::abs (p - prev) > 0.002f || ! knob.getProperties().contains ("mod"))
+    {
+        knob.getProperties().set ("mod", p);
+        knob.repaint();
+    }
+}
+
+void ConcentricKnob::resized()
+{
+    auto b = getLocalBounds();
+    b.removeFromTop (16);
+    b.removeFromBottom (18);
+    const int side = jmin (b.getWidth(), b.getHeight());
+    dial = b.withSizeKeepingCentre (side, side);
+    ring.setBounds (dial);
+    knob.setBounds (dial.reduced (12));
+}
+
+void ConcentricKnob::paint (Graphics& g)
+{
+    auto b = getLocalBounds();
+    g.setFont (FontOptions (11.0f, Font::bold));
+    g.setColour (colours::dim);
+    g.drawText (knobName, b.removeFromTop (16), Justification::centred);
+    auto bottom = b.removeFromBottom (18);
+    const String ringText = ring.getTextFromValue (ring.getValue());
+    g.setFont (FontOptions (14.0f));
+    g.setColour (colours::text);
+    g.drawText (knob.getTextFromValue (knob.getValue()), bottom.removeFromLeft (bottom.getWidth() / 2).withTrimmedRight (6), Justification::centredRight);
+    g.setFont (FontOptions (12.0f));
+    g.setColour (std::abs (ring.getValue()) > 0.05 ? colours::level : colours::dim);
+    g.drawText (ringName + " " + ringText, bottom.withTrimmedLeft (6), Justification::centredLeft);
+}
+
+//==============================================================================
 TheGateEditor::TheGateEditor (TheGateProcessor& p)
-    : AudioProcessorEditor (&p), proc (p), display (p)
+    : AudioProcessorEditor (&p), proc (p), display (p),
+      glowDrive (p.apvts, tg::pid::glowDrive, tg::pid::glowEnv, "DRIVE", "ENV",
+                 "DRIVE (center knob): how hard Micro Glow is hit, on Glow's Drive scale. The output is loudness-matched, so this changes the color and density, not the level. Double-click: 25.",
+                 "ENV (outer ring): the envelope follower. Hits that rise above the track's own average push Drive up (right of center) or pull it back (left), always returning to the knob setting. The violet dot on the knob shows where Drive is right now. Double-click: off.")
 {
     setLookAndFeel (&look);
     { tg::MeterFrame f; while (proc.engine.meters.pop (f)) {} }   // drop frames queued while the window was closed
@@ -209,9 +313,8 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     makeKnob (levelAmount, tg::pid::levelAmount, "AMOUNT", "How much of the gap to the target each hit closes. 100 % = every hit lands on the target; 50 % = halfway.");
     makeKnob (levelTarget, tg::pid::levelTarget, "TARGET", "The peak level hits are evened towards. Bottom = Auto: the running average of the last few hits, so the overall level stays put and only the hit-to-hit differences shrink.");
     makeKnob (levelMax,    tg::pid::levelMax,    "MAX",    "The most any single hit is turned up or down.");
-    makeKnob (glowDrive,   tg::pid::glowDrive,   "DRIVE",  "Gain into Micro Glow. Below the ceiling it's just level; past it, peaks saturate.");
-    makeKnob (glowCeiling, tg::pid::glowCeiling, "CEILING","The level peaks can't go past. Everything well below it is untouched.");
-    makeChoice (glowType, tg::pid::glowType, "TYPE", "TUBE: Glow's tube output stage, soft with a little 2nd harmonic. DIODE: Glow's diode, softer and warmer (more 2nd). CLIP: near-hard and symmetric, odd harmonics only: shaves peaks flat.");
+    addAndMakeVisible (glowDrive);
+    makeChoice (glowType, tg::pid::glowType, "TYPE", "TUBE: Glow's tube output stage: the whole sound thickens, softer and rounder as Drive goes up. IRON: Glow's transformer: only the lows (below ~126 Hz) saturate and compress; mids and highs pass clean.");
 
     auto setupOn = [this] (TextButton& b, const char* id, std::unique_ptr<AudioProcessorValueTreeState::ButtonAttachment>& att, const String& tip)
     {
@@ -221,7 +324,7 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
         att = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, id, b);
     };
     setupOn (levelerOn, tg::pid::levelerOn, levelerOnAtt, "Leveler on/off. Evens out soft and loud hits: each hit's peak is measured during the lookahead and its gain set before it plays, so transients are never ramped. Works best with 5 ms lookahead or more.");
-    setupOn (glowOn,    tg::pid::glowOn,    glowOnAtt,    "Micro Glow on/off: a saturator/clipper from Glow at the output, after the gate and leveler, oversampled to ~384 kHz and linear-phase. Switching it never changes the latency.");
+    setupOn (glowOn,    tg::pid::glowOn,    glowOnAtt,    "Micro Glow on/off: Glow's saturation at the output, after the gate and leveler. Oversampled to ~384 kHz, linear-phase, loudness-matched. Switching it never changes the latency.");
 
     listen.setClickingTogglesState (true);
     listen.setTooltip ("Hear the key exactly as the detector hears it (after the key HPF and high cut).");
@@ -271,8 +374,9 @@ void TheGateEditor::timerCallback()
     // dim a section's controls while it's off
     const float lvl = levelerOn.getToggleState() ? 1.0f : 0.4f, glw = glowOn.getToggleState() ? 1.0f : 0.4f;
     for (auto* k : { &levelAmount, &levelTarget, &levelMax }) { k->slider.setAlpha (lvl); k->label.setAlpha (lvl); }
-    for (auto* k : { &glowDrive, &glowCeiling }) { k->slider.setAlpha (glw); k->label.setAlpha (glw); }
+    glowDrive.setAlpha (glw);
     glowType.box.setAlpha (glw); glowType.label.setAlpha (glw);
+    glowDrive.setModulated (proc.engine.glowModulatedDrive());
 }
 
 void TheGateEditor::paint (Graphics& g)
@@ -371,12 +475,11 @@ void TheGateEditor::resized()
         placeKnob (levelAmount, cols[0]); placeKnob (levelTarget, cols[1]); placeKnob (levelMax, cols[2]);
     }
     {
-        auto a = glowArea.reduced (8).withTrimmedTop (22);
-        auto cols = columns (a.removeFromTop (120), 3);
-        auto t = cols[0].reduced (4, 0);
-        t.removeFromTop (34);
+        auto a = glowArea.reduced (8, 4).withTrimmedTop (14);
+        auto t = a.removeFromLeft (a.getWidth() * 2 / 5).reduced (10, 0);
+        t.removeFromTop ((t.getHeight() - 42) / 2);
         glowType.label.setBounds (t.removeFromTop (16));
         glowType.box.setBounds (t.removeFromTop (26));
-        placeKnob (glowDrive, cols[1]); placeKnob (glowCeiling, cols[2]);
+        glowDrive.setBounds (a.removeFromLeft (a.getWidth() * 3 / 4).withTrimmedBottom (2));
     }
 }

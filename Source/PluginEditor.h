@@ -22,6 +22,32 @@ private:
 };
 
 //==============================================================================
+// A concentric pot: the main knob in the middle, a second control as a ring around it.
+// The ring only takes the mouse on the ring itself, so the two never get in each other's way.
+class ConcentricKnob : public juce::Component
+{
+public:
+    ConcentricKnob (juce::AudioProcessorValueTreeState&, const char* knobId, const char* ringId,
+                    const juce::String& knobName, const juce::String& ringName,
+                    const juce::String& knobTip, const juce::String& ringTip);
+    void setModulated (float knobValue);   // live value of the knob incl. modulation (drawn as a dot)
+    void resized() override;
+    void paint (juce::Graphics&) override;
+
+    struct RingSlider : juce::Slider
+    {
+        bool hitTest (int x, int y) override;
+    };
+
+private:
+    RingSlider ring;
+    juce::Slider knob;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> knobAtt, ringAtt;
+    juce::String knobName, ringName;
+    juce::Rectangle<int> dial;
+};
+
+//==============================================================================
 class TheGateLook : public juce::LookAndFeel_V4
 {
 public:
@@ -65,7 +91,8 @@ private:
     GateDisplay display;
 
     Knob threshold, hysteresis, attack, hold, release, range, keyHpf, keyHighCut, tracking;
-    Knob levelAmount, levelTarget, levelMax, glowDrive, glowCeiling;
+    Knob levelAmount, levelTarget, levelMax;
+    ConcentricKnob glowDrive;
     Choice lookahead, keySource, glowType;
     juce::TextButton listen { "LISTEN KEY" }, levelerOn { "ON" }, glowOn { "ON" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> listenAtt, levelerOnAtt, glowOnAtt;

@@ -227,7 +227,7 @@ static void testBlockSizeIndependence()
         s.keyHpfHz = 80.0f; s.keyHighCutHz = 8000.0f; s.trackingPct = 70.0f; s.rangeDb = -40.0f; s.holdMs = 15.0f;
         s.externalKey = variant & 1; s.listen = variant == 2; s.lookaheadMs = variant == 3 ? 0.0f : 10.0f;
         s.levelerOn = true; s.levelTarget = variant == 1 ? -10.0f : tg::GateSettings::kAutoTarget;
-        s.glow.on = variant != 2; s.glow.type = variant % 3; s.glow.driveDb = 9.0f; s.glow.ceilingDb = -3.0f;
+        s.glow.on = variant != 2; s.glow.type = variant % 2; s.glow.drive = 60.0f; s.glow.envAmount = variant == 1 ? -70.0f : 80.0f;
         Buf a = run (in, s, sr, 512, &key);
         Buf b = run (in, s, sr, 0, &key, 99);
         Buf c = run (in, s, sr, 1, &key);
@@ -245,7 +245,7 @@ static void testNoAllocations()
     const size_t n = (size_t) sr * 2;
     Buf in = makeDrumTrack (sr, n, 21), key = makeDrumTrack (sr, n, 22);
     tg::GateSettings s; s.keyHpfHz = 60.0f; s.trackingPct = 100.0f; s.externalKey = true;
-    s.levelerOn = true; s.glow.on = true; s.glow.driveDb = 12.0f; s.glow.type = tg::MicroGlow::diode;
+    s.levelerOn = true; s.glow.on = true; s.glow.drive = 80.0f; s.glow.envAmount = 60.0f; s.glow.type = tg::MicroGlow::iron;
     tg::GateEngine e;
     e.prepare (sr, 2);
     run (in, s, sr, 0, &key, 5, &e, true);
@@ -638,141 +638,214 @@ static double goertzelDb (const std::vector<float>& x, size_t from, size_t len, 
     return 20 * std::log10 (std::max (2 * std::sqrt (re * re + im * im) / wsum, 1e-12));
 }
 
-static tg::GateSettings glowSettings (int type, float drive, float ceiling)
+static tg::GateSettings glowSettings (int type, float drive, float env = 0.0f)
 {
     tg::GateSettings s; s.rangeDb = 0.0f;   // gate fully open: only Micro Glow acts
-    s.glow.on = true; s.glow.type = type; s.glow.driveDb = drive; s.glow.ceilingDb = ceiling;
+    s.glow.on = true; s.glow.type = type; s.glow.drive = drive; s.glow.envAmount = env;
     return s;
 }
 
-static void testGlowTransparentBelowKnee()
+static const char* glowName (int t) { return t == tg::MicroGlow::tube ? "TUBE" : "IRON"; }
+
+static Buf tone (double f, float amp, double sr, size_t n)
 {
-    std::printf ("Micro Glow below the knee: the oversampling is linear-phase and flat (null vs the delayed input)\n");
+    Buf b = makeBuf (1, n);
+    for (size_t i = 0; i < n; ++i) b[0][i] = amp * (float) std::sin (2 * M_PI * f * (double) i / sr);
+    return b;
+}
+
+// harmonics 2..8 relative to the fundamental, in dB
+static double thdDb (const std::vector<float>& x, double f0, double sr)
+{
+    const double h1 = std::pow (10.0, goertzelDb (x, 32768, 32768, f0, sr) / 20.0);
+    double p = 0;
+    for (int k = 2; k <= 8 && k * f0 < sr / 2; ++k) p += std::pow (std::pow (10.0, goertzelDb (x, 32768, 32768, k * f0, sr) / 20.0), 2.0);
+    return 10 * std::log10 (p / (h1 * h1) + 1e-30);
+}
+
+static double rmsDb (const std::vector<float>& x, size_t from, size_t to)
+{
+    double p = 0; for (size_t i = from; i < to; ++i) p += (double) x[i] * x[i];
+    return 10 * std::log10 (p / (double) (to - from) + 1e-30);
+}
+
+static void testGlowTransparentBelowCurve()
+{
+    std::printf ("Micro Glow below the curve: linear-phase and flat (null vs the delayed input)\n");
     for (double sr : { 44100.0, 48000.0, 96000.0 })
     {
-        const size_t n = (size_t) sr;
+        const size_t n = (size_t) sr * 2;
         Buf in = makeBuf (1, n);
         const double freqs[] = { 40, 100, 440, 1000, 3000, 8000, 12000, 16000, 18000 };
         for (size_t i = 0; i < n; ++i)
             for (double f : freqs) in[0][i] += 0.003f * (float) std::sin (2 * M_PI * f * (double) i / sr + f);
-        tg::GateSettings s = glowSettings (tg::MicroGlow::clip, 0.0f, 0.0f);   // -50 dBFS per tone: nowhere near the knee
-        tg::GateEngine e;
-        Buf out = run (in, s, sr, 0, nullptr, 1, &e);
-        const size_t L = (size_t) e.currentLatency();
-        double num = 0, den = 0;
-        for (size_t i = (size_t) sr / 4; i < n; ++i) { const double d = out[0][i] - in[0][i - L]; num += d * d; den += (double) in[0][i - L] * in[0][i - L]; }
-        const double nullDb = 10 * std::log10 (num / den);
-        std::printf ("  %.0f kHz: null %.1f dB (40 Hz - 18 kHz, %dx oversampling)\n", sr / 1000, nullDb, sr < 60000 ? 8 : 4);
-        CHECK (nullDb < -70.0, "sr %.0f null only %.1f dB", sr, nullDb);
-    }
-}
-
-static void testGlowSmallSignalAndCeiling()
-{
-    std::printf ("Micro Glow: unity below the knee for every type; peaks held at the Ceiling\n");
-    const double sr = 48000;
-    const size_t n = 48000;
-    const char* names[] = { "TUBE", "DIODE", "CLIP" };
-    for (int t = 0; t < 3; ++t)
-    {
-        Buf quiet = makeBuf (1, n), loud = makeBuf (1, n);
-        for (size_t i = 0; i < n; ++i)
+        for (int t = 0; t < 2; ++t)
         {
-            quiet[0][i] = 0.01f * (float) std::sin (2 * M_PI * 1000 * i / sr);   // -40 dBFS
-            loud[0][i]  = 0.5f  * (float) std::sin (2 * M_PI * 100 * i / sr);    // -6 dBFS, +12 dB drive -> 12 dB over a -6 dB ceiling
+            tg::GateEngine e;
+            Buf out = run (in, glowSettings (t, 0.0f), sr, 0, nullptr, 1, &e);   // -50 dBFS tones: nowhere near the curve
+            const size_t L = (size_t) e.currentLatency();
+            double num = 0, den = 0;
+            for (size_t i = n / 2; i < n; ++i) { const double d = out[0][i] - in[0][i - L]; num += d * d; den += (double) in[0][i - L] * in[0][i - L]; }
+            const double nullDb = 10 * std::log10 (num / den);
+            std::printf ("  %.0f kHz %s: null %.1f dB (40 Hz - 18 kHz, %dx oversampling)\n", sr / 1000, glowName (t), nullDb, sr < 60000 ? 8 : 4);
+            CHECK (nullDb < -60.0, "sr %.0f %s null only %.1f dB", sr, glowName (t), nullDb);
         }
-        Buf q = run (quiet, glowSettings (t, 0.0f, 0.0f), sr, 0);
-        const double qDb = goertzelDb (q[0], 8000, 32768, 1000, sr) - goertzelDb (quiet[0], 8000, 32768, 1000, sr);
-        Buf l = run (loud, glowSettings (t, 12.0f, -6.0f), sr, 0);
-        const float pk = peakDbIn (l[0], 8000, n);
-        std::printf ("  %-5s: -40 dBFS tone %+.4f dB; hard-driven peak %.2f dBFS (ceiling -6.00)\n", names[t], qDb, pk);
-        CHECK (std::abs (qDb) < 0.01, "%s small-signal gain %.4f dB", names[t], qDb);
-        CHECK (pk <= -6.0f + 0.8f && pk > -6.0f - 1.5f, "%s peak %.2f dBFS vs ceiling -6", names[t], pk);
     }
 }
 
-static void testGlowHarmonics()
+static void testGlowDriveAndAutoGain()
 {
-    std::printf ("Micro Glow harmonics: TUBE/DIODE add 2nd harmonic, CLIP is odd-only\n");
+    std::printf ("Micro Glow Drive: more harmonics as it goes up, loudness held by the auto gain\n");
     const double sr = 48000;
-    const size_t n = 65536;
-    Buf in = makeBuf (1, n);
-    for (size_t i = 0; i < n; ++i) in[0][i] = 0.5f * (float) std::sin (2 * M_PI * 187.5 * i / sr);
-    const char* names[] = { "TUBE", "DIODE", "CLIP" };
-    for (int t = 0; t < 3; ++t)
+    const size_t n = 96000;
+    Buf in = tone (80.0, 0.5f, sr, n);   // -6 dBFS, 80 Hz (inside IRON's flux band)
+    const double inRms = rmsDb (in[0], n / 2, n);
+    for (int t = 0; t < 2; ++t)
     {
-        Buf o = run (in, glowSettings (t, 9.0f, -3.0f), sr, 0);
-        const double h1 = goertzelDb (o[0], 16384, 32768, 187.5, sr);
-        const double h2 = goertzelDb (o[0], 16384, 32768, 375.0, sr) - h1;
-        const double h3 = goertzelDb (o[0], 16384, 32768, 562.5, sr) - h1;
-        std::printf ("  %-5s: 2nd %.1f dBc, 3rd %.1f dBc\n", names[t], h2, h3);
-        if (t == tg::MicroGlow::clip) CHECK (h2 < -90.0, "CLIP made 2nd harmonic at %.1f dBc", h2);
-        else                          CHECK (h2 > -60.0, "%s 2nd harmonic only %.1f dBc", names[t], h2);
-        CHECK (h3 > -40.0, "%s 3rd harmonic only %.1f dBc", names[t], h3);
+        double prev = -300;
+        std::printf ("  %s THD at Drive 0/25/50/75/100:", glowName (t));
+        for (float d : { 0.0f, 25.0f, 50.0f, 75.0f, 100.0f })
+        {
+            tg::GateEngine e;
+            Buf o = run (in, glowSettings (t, d), sr, 0, nullptr, 1, &e);
+            const double thd = thdDb (o[0], 80.0, sr), lv = rmsDb (o[0], n / 2, n) - inRms;
+            std::printf (" %.1f dB (level %+.2f)", thd, lv);
+            CHECK (thd > prev, "%s THD didn't rise at Drive %.0f", glowName (t), d);
+            CHECK (std::abs (lv) < 0.1, "%s level moved %.2f dB at Drive %.0f", glowName (t), lv, d);
+            prev = thd;
+        }
+        std::printf ("\n");
+    }
+}
+
+static void testIronLowsOnly()
+{
+    std::printf ("IRON saturates the lows; mids and highs pass clean (TUBE colors everything)\n");
+    const double sr = 48000;
+    const size_t n = 96000;
+    for (int t = 0; t < 2; ++t)
+    {
+        const double lo = thdDb (run (tone (60.0, 0.5f, sr, n), glowSettings (t, 75.0f), sr, 0)[0], 60.0, sr);
+        const double hi = thdDb (run (tone (2000.0, 0.5f, sr, n), glowSettings (t, 75.0f), sr, 0)[0], 2000.0, sr);
+        std::printf ("  %s at Drive 75, -6 dBFS: 60 Hz THD %.1f dB, 2 kHz THD %.1f dB\n", glowName (t), lo, hi);
+        if (t == tg::MicroGlow::iron) CHECK (hi < lo - 20.0, "IRON 2 kHz THD %.1f not well below 60 Hz %.1f", hi, lo);
+    }
+}
+
+static void testGlowEvenHarmonics()
+{
+    std::printf ("Micro Glow harmonics: both types are asymmetric (2nd harmonic) like Glow\n");
+    const double sr = 48000;
+    for (int t = 0; t < 2; ++t)
+    {
+        Buf o = run (tone (93.75, 0.5f, sr, 98304), glowSettings (t, 75.0f), sr, 0);
+        const double h1 = goertzelDb (o[0], 32768, 32768, 93.75, sr);
+        const double h2 = goertzelDb (o[0], 32768, 32768, 187.5, sr) - h1, h3 = goertzelDb (o[0], 32768, 32768, 281.25, sr) - h1;
+        std::printf ("  %s at Drive 75: 2nd %.1f dBc, 3rd %.1f dBc\n", glowName (t), h2, h3);
+        CHECK (h2 > -60.0, "%s 2nd harmonic only %.1f dBc", glowName (t), h2);
     }
 }
 
 static void testGlowAliasing()
 {
-    std::printf ("Micro Glow aliasing, 18 dB into a -6 dBFS ceiling (tones that don't divide 48 kHz, so aliases can't hide on harmonics)\n");
+    std::printf ("Micro Glow aliasing, -6 dBFS tones (that don't divide 48 kHz, so aliases can't hide on harmonics)\n");
     const double sr = 48000;
-    const size_t n = 65536;
-    const char* names[] = { "TUBE", "DIODE", "CLIP" };
+    const size_t n = 98304;
     auto worstAlias = [&] (const std::vector<float>& x, double f0)
     {
-        const double ref = goertzelDb (x, 16384, 32768, f0, sr);
+        const double ref = goertzelDb (x, 32768, 32768, f0, sr);
         double w = -300;
         for (double f = 100; f < 20000; f += 13)
         {
             const double r = std::fmod (f, f0);
             if (r < 40 || r > f0 - 40) continue;   // skip the harmonics themselves
-            w = std::max (w, goertzelDb (x, 16384, 32768, f, sr) - ref);
+            w = std::max (w, goertzelDb (x, 32768, 32768, f, sr) - ref);
         }
         return w;
     };
     tg::MicroGlow mg; mg.prepare (sr, 1);
-    for (double f0 : { 2113.0, 6997.0 })
-    {
-        Buf in = makeBuf (1, n);
-        for (size_t i = 0; i < n; ++i) in[0][i] = 0.5f * (float) std::sin (2 * M_PI * f0 * (double) i / sr);
-        for (int t = 0; t < 3; ++t)
+    for (float drive : { 50.0f, 100.0f })
+        for (double f0 : { 2113.0, 6997.0 })
         {
-            Buf o = run (in, glowSettings (t, 18.0f, -6.0f), sr, 0);
-            std::vector<float> naive (n);   // the same curve straight at 48 kHz
-            for (size_t i = 0; i < n; ++i) naive[i] = mg.curve (t, in[0][i] * dbToLin (18.0f), dbToLin (-6.0f));
-            const double ours = worstAlias (o[0], f0), raw = worstAlias (naive, f0);
-            std::printf ("  %-5s %4.0f Hz: worst alias %6.1f dBc (no oversampling: %5.1f dBc)\n", names[t], f0, ours, raw);
-            if (f0 < 3000) CHECK (ours < -90.0, "%s %.0f Hz alias %.1f dBc", names[t], f0, ours);
-            CHECK (ours < raw - 30.0, "%s %.0f Hz: oversampling only gained %.1f dB", names[t], f0, raw - ours);
+            Buf in = tone (f0, 0.5f, sr, n);
+            std::vector<float> naive (n);   // the TUBE curve straight at 48 kHz
+            for (size_t i = 0; i < n; ++i) naive[i] = mg.tubeCurve (in[0][i], drive);
+            const double tube = worstAlias (run (in, glowSettings (tg::MicroGlow::tube, drive), sr, 0)[0], f0);
+            const double iron = worstAlias (run (in, glowSettings (tg::MicroGlow::iron, drive), sr, 0)[0], f0);
+            const double raw = worstAlias (naive, f0);
+            std::printf ("  Drive %3.0f, %4.0f Hz: TUBE %6.1f dBc (no oversampling %5.1f), IRON %6.1f dBc\n", drive, f0, tube, raw, iron);
+            if (f0 < 3000) CHECK (tube < (drive < 75 ? -90.0 : -80.0), "TUBE drive %.0f %.0f Hz alias %.1f dBc", drive, f0, tube);
+            if (drive < 75) CHECK (tube < raw - 30.0, "TUBE drive %.0f %.0f Hz: oversampling only gained %.1f dB", drive, f0, raw - tube);
+            CHECK (iron < -90.0, "IRON drive %.0f %.0f Hz alias %.1f dBc", drive, f0, iron);
         }
+}
+
+static void testGlowEnvelope()
+{
+    std::printf ("Micro Glow envelope (Glow's follower): hits above the track's average push Drive away from the knob and it comes back\n");
+    const double sr = 48000;
+    std::vector<float> peaks;
+    std::mt19937 rng (8);
+    std::uniform_real_distribution<float> u (-24.0f, -3.0f);
+    for (int k = 0; k < 30; ++k) peaks.push_back (u (rng));
+    Buf in = makeBuf (1, 12000 * peaks.size() + 24000);
+    makeHits (in[0], sr, peaks, 12000);
+    for (float env : { 0.0f, 100.0f, -100.0f })
+    {
+        tg::GateSettings s = glowSettings (tg::MicroGlow::tube, 40.0f, env);
+        tg::GateEngine e; e.prepare (sr, 1); e.setSettings (s); e.reset();
+        std::vector<float> x = in[0];
+        float lo = 1e9f, hi = -1e9f;
+        for (size_t pos = 0; pos + 256 <= x.size(); pos += 256)
+        {
+            float* p = x.data() + pos;
+            e.process (&p, 1, nullptr, 0, 256);
+            tg::MeterFrame f; while (e.meters.pop (f)) {}
+            if (pos > 48000) { lo = std::min (lo, e.glowModulatedDrive()); hi = std::max (hi, e.glowModulatedDrive()); }
+        }
+        std::printf ("  amount %+4.0f %%: Drive moved between %.1f and %.1f (knob 40)\n", env, lo, hi);
+        if (env > 0)      { CHECK (hi > 55.0 && lo >= 39.99f, "env + range %.1f..%.1f", lo, hi); }
+        else if (env < 0) { CHECK (lo < 25.0 && hi <= 40.01f, "env - range %.1f..%.1f", lo, hi); }
+        else              { CHECK (lo == 40.0f && hi == 40.0f, "env 0 moved Drive %.1f..%.1f", lo, hi); }
     }
 }
 
 static void testGlowSwitchingClickFree()
 {
-    std::printf ("Micro Glow: On/Off and type changes crossfade (no clicks)\n");
+    std::printf ("Micro Glow: On/Off and type changes crossfade (no clicks beyond the waveforms' own steepness)\n");
     const double sr = 48000;
     const size_t n = (size_t) sr * 2;
-    std::vector<float> x (n);
-    for (size_t i = 0; i < n; ++i) x[i] = 0.7f * (float) std::sin (2 * M_PI * 100 * i / sr);
-    tg::GateSettings s = glowSettings (tg::MicroGlow::clip, 12.0f, -6.0f);
-    tg::GateEngine e; e.prepare (sr, 1); e.setSettings (s); e.reset();
-    double worst = 0; float prev = 0;
-    for (size_t pos = 0; pos < n; pos += 128)
+    std::vector<float> src (n);
+    for (size_t i = 0; i < n; ++i) src[i] = 0.7f * (float) std::sin (2 * M_PI * 100 * i / sr);
+    auto worstJump = [&] (bool toggle, int fixedType, bool fixedOn)
     {
-        const size_t step = pos / 4800;   // every 100 ms
-        s.glow.on = (step % 3) != 0;
-        s.glow.type = (int) ((step / 2) % 3);
-        e.setSettings (s);
-        float* p = x.data() + pos;
-        e.process (&p, 1, nullptr, 0, 128);
-        tg::MeterFrame f; while (e.meters.pop (f)) {}
-        for (int i = 0; i < 128; ++i) { if (pos + (size_t) i > 0) worst = std::max (worst, (double) std::abs (p[i] - prev)); prev = p[i]; }
-    }
-    // dry 0.7 vs clipped ~0.5: at most ~1.2 apart over a 240-sample crossfade, plus the waveforms' own slope
-    const double bound = 1.2 / 240.0 + 0.7 * 2 * M_PI * 100 / sr * 4.0 * 1.6;
-    std::printf ("  worst jump %.4f (bound %.4f)\n", worst, bound);
-    CHECK (worst <= bound, "jump %.4f", worst);
+        std::vector<float> x = src;
+        tg::GateSettings s = glowSettings (fixedType, 90.0f);
+        s.glow.on = fixedOn;
+        tg::GateEngine e; e.prepare (sr, 1); e.setSettings (s); e.reset();
+        double worst = 0; float prev = 0;
+        for (size_t pos = 0; pos < n; pos += 128)
+        {
+            if (toggle)
+            {
+                const size_t step = pos / 4800;   // every 100 ms
+                s.glow.on = (step % 3) != 0;
+                s.glow.type = (int) ((step / 2) % 2);
+                e.setSettings (s);
+            }
+            float* p = x.data() + pos;
+            e.process (&p, 1, nullptr, 0, 128);
+            tg::MeterFrame f; while (e.meters.pop (f)) {}
+            for (int i = 0; i < 128; ++i) { if (pos + (size_t) i > 4800) worst = std::max (worst, (double) std::abs (p[i] - prev)); prev = p[i]; }
+        }
+        return worst;
+    };
+    // steepest the steady signals ever get (dry, TUBE, IRON), then the switching run
+    const double steady = std::max ({ worstJump (false, 0, false), worstJump (false, 0, true), worstJump (false, 1, true) });
+    const double switching = worstJump (true, 0, true);
+    // a crossfade between two signals at most ~1.4 apart over 240 samples adds ~0.006 per sample
+    std::printf ("  steepest steady signal %.4f per sample; while switching %.4f\n", steady, switching);
+    CHECK (switching <= steady + 1.4 / 240.0 + 1e-4, "switching jump %.4f vs steady %.4f", switching, steady);
 }
 
 int main()
@@ -798,10 +871,12 @@ int main()
     testLevelerRolls();
     testLevelerNoLookahead();
     testLevelerClickFreeAndOff();
-    testGlowTransparentBelowKnee();
-    testGlowSmallSignalAndCeiling();
-    testGlowHarmonics();
+    testGlowTransparentBelowCurve();
+    testGlowDriveAndAutoGain();
+    testIronLowsOnly();
+    testGlowEvenHarmonics();
     testGlowAliasing();
+    testGlowEnvelope();
     testGlowSwitchingClickFree();
     std::printf ("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILED", gFailures);
     return gFailures == 0 ? 0 : 1;

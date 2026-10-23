@@ -26,7 +26,7 @@ namespace tg::pid
     inline constexpr const char* glowOn      = "glowOn";
     inline constexpr const char* glowType    = "glowType";
     inline constexpr const char* glowDrive   = "glowDrive";
-    inline constexpr const char* glowCeiling = "glowCeiling";
+    inline constexpr const char* glowEnv     = "glowEnv";
 }
 
 namespace tg

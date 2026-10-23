@@ -495,6 +495,8 @@ public:
     double currentGain() const noexcept { return g; }
     double currentHighCutHz() const noexcept { return lpfOn ? hcNow : 0.0; }
     double currentLevelerGain() const noexcept { return lvlGain; }
+    float glowModulatedDrive() const noexcept { return glow.modulatedDrive(); }
+    float glowAutoGainDb() const noexcept { return glow.autoGainDb(); }
 
 private:
     static double dbToGain (double db) noexcept { return db <= kFullyShutDb ? 0.0 : std::pow (10.0, db / 20.0); }

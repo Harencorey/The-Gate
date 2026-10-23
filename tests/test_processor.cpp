@@ -114,9 +114,9 @@ static void testStateRoundTrip()
     setParam (a, tg::pid::levelTarget, -18.0f);
     setParam (a, tg::pid::levelMax, 9.0f);
     setParam (a, tg::pid::glowOn, 1.0f);
-    setParam (a, tg::pid::glowType, 2.0f);
-    setParam (a, tg::pid::glowDrive, 7.5f);
-    setParam (a, tg::pid::glowCeiling, -4.0f);
+    setParam (a, tg::pid::glowType, 1.0f);
+    setParam (a, tg::pid::glowDrive, 63.0f);
+    setParam (a, tg::pid::glowEnv, -40.0f);
     MemoryBlock mb;
     a.getStateInformation (mb);
     TheGateProcessor b;
@@ -136,21 +136,30 @@ static void testPhase2Params()
     setLayout (p, AudioChannelSet::mono(), AudioChannelSet::disabled());
     setParam (p, tg::pid::range, 0.0f);   // gate fully open
     setParam (p, tg::pid::glowOn, 1.0f);
-    setParam (p, tg::pid::glowType, 2.0f);
-    setParam (p, tg::pid::glowDrive, 12.0f);
-    setParam (p, tg::pid::glowCeiling, -6.0f);
+    setParam (p, tg::pid::glowType, 0.0f);
+    setParam (p, tg::pid::glowDrive, 80.0f);
     p.prepareToPlay (48000, 256);
     const int L0 = p.getLatencySamples();
     AudioBuffer<float> buf (1, 256);
     MidiBuffer midi;
-    float pk = 0;
-    for (int blk = 0; blk < 100; ++blk)
+    double pin = 0, pout = 0, h3 = 0;
+    for (int blk = 0; blk < 800; ++blk)
     {
-        for (int i = 0; i < 256; ++i) buf.setSample (0, i, 0.5f * (float) std::sin (2 * MathConstants<double>::pi * 100 * (blk * 256 + i) / 48000.0));
+        for (int i = 0; i < 256; ++i) buf.setSample (0, i, 0.5f * (float) std::sin (2 * MathConstants<double>::pi * 93.75 * (blk * 256 + i) / 48000.0));
+        if (blk > 400) pin += buf.getRMSLevel (0, 0, 256);
         p.processBlock (buf, midi);
-        if (blk > 20) pk = std::max (pk, buf.getMagnitude (0, 256));
+        if (blk > 400) pout += buf.getRMSLevel (0, 0, 256);
+        if (blk == 799)   // 3rd harmonic of the last block (256 samples = 1/2 cycle of 93.75 Hz... use correlation over the block)
+        {
+            double re = 0, im = 0;
+            for (int i = 0; i < 256; ++i) { const double w = 2 * MathConstants<double>::pi * 281.25 * i / 48000.0; re += buf.getSample (0, i) * std::cos (w); im += buf.getSample (0, i) * std::sin (w); }
+            h3 = std::sqrt (re * re + im * im) / 128.0;
+        }
     }
-    CHECK (std::abs (Decibels::gainToDecibels (pk) + 6.0f) < 0.3f, "Micro Glow ceiling not applied (peak %.2f dBFS)", Decibels::gainToDecibels (pk));
+    const double lv = Decibels::gainToDecibels (pout / pin);
+    std::printf ("  Micro Glow TUBE Drive 80 on a -6 dBFS tone: level %+.2f dB, 3rd harmonic %.1f dBFS\n", lv, Decibels::gainToDecibels (h3));
+    CHECK (std::abs (lv) < 0.2, "Micro Glow not loudness-matched (%+.2f dB)", lv);
+    CHECK (h3 > 0.03, "Micro Glow Drive didn't saturate (3rd harmonic %.4f)", h3);
     setParam (p, tg::pid::glowOn, 0.0f);
     p.processBlock (buf, midi);
     CHECK (p.getLatencySamples() == L0, "latency changed when Micro Glow switched off");
