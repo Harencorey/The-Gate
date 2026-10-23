@@ -2,9 +2,10 @@
 
 A source-aware gate for live use and mixing. The full plan is in [ROADMAP.md](ROADMAP.md).
 
-**Current stage: Phase 2.** A pro-grade gate (lookahead, sidechain, detection filters, tracking high cut)
-plus the **Leveler** (evens out soft and loud hits) and **Micro Glow** (Glow's saturation and a clipper at the
-output). The spectral decay, source models and instance network come next and plug into this core.
+**Current stage: Phase 3 (on the `phase-3` branch).** A pro-grade gate (lookahead, sidechain, detection
+filters, tracking high cut), the **Leveler** (evens out soft and loud hits), the **Spectral Decay** (the tail
+keeps the source's own partials and closes everything else) and **Micro Glow** (Glow's Tube and Iron with its
+envelope follower). The source models, training and instance network come next and plug into this core.
 
 ## Install
 
@@ -15,7 +16,7 @@ Every past version stays downloadable at https://github.com/Harencorey/the-gate/
 
 ## Controls
 
-The window: a scrolling view on top, then **DETECT**, **ENVELOPE** and **KEY FILTERS**, then **LEVELER** and **MICRO GLOW**.
+The window: a scrolling view on top, then **DETECT**, **ENVELOPE** and **KEY FILTERS**, then **LEVELER**, **SPECTRAL DECAY** and **MICRO GLOW**.
 Hover any control for about 3 seconds for an explanation.
 
 **The view** (about 3 seconds, newest on the right): the grey shape is the input, the brighter shape inside it is
@@ -50,11 +51,42 @@ holds through the whole decay. So the transient is never ramped and the tail kee
 | **Target** | The peak level hits are evened towards. Bottom = **Auto**: the running average of the last ~8 hits, so the overall level stays where it is and only the hit-to-hit differences shrink. |
 | **Max** | The most any one hit is turned up or down (±0–24 dB). |
 
-Every stroke counts as a hit, even in a roll or a flam where the gate never closes: strokes are found on the
-key's slope (its high-frequency content), so a ghost note sitting just above the last hit's ringing tail is
-still picked out and timed to the sample. With 5 ms lookahead the leveler judges each hit by its first
+Every stroke counts as a hit, even in a roll or a flam where the gate never closes: a sharp edge in the key
+that lifts its peak 4 dB over the ringing tail, or a 6 dB jump in its smooth level (which still works under
+cymbal wash that hides the edge), timed to where the stroke began. A hi-hat tick riding on a tom's tail isn't a
+stroke, and neither is the gate wobbling back open on a decaying note (within 50 ms, no edge or jump). The
+limit: a ghost note less than ~4 dB above a still-ringing hit is heard as part of it (Phases 4 and 6 sort
+those out by what the sound is and which mic it belongs to). With 5 ms lookahead the leveler judges each hit by its first
 3.5 ms; with 2 ms, its first 1.25 ms; with Lookahead Off it measures the first 1 ms and the gain lands 2 ms
 into the hit (so the attack is shaped a little).
+
+### Spectral Decay (on/off)
+
+The gate's tail, shaped by what the source actually is. It **learns the source's partials** (a tom's
+fundamental and overtones, a kick's body, a shell's ring) from its own hits, and **learns the bleed** from
+the moments the gate is shut. The attack is exactly the plain gate, so the transient is never filtered. From
+5 ms after each hit:
+- the source's **partials** (resonant filters locked to them, 0 dB and 0° at their centre) ring with the gate,
+  or longer with Sustain;
+- **everything else** (cymbal wash, hats, snare buzz, room) closes faster, set by Focus.
+
+Zero latency, no phase shift: with every gain equal (Focus 0 and Sustain 0, or during any attack) the output
+is bit-for-bit the plain gate. When a new stroke comes in while the rest is closed, the rest ramps back up so
+it's fully open exactly on the transient (using the lookahead), like the gate's own attack.
+
+| Control | What it does |
+|---|---|
+| **Focus** | How fast everything that isn't the source closes in the tail. 0 % = like the plain gate; 100 % = the whole range in 1/20 of the Release, leaving the source's own partials. |
+| **Sustain** | How much longer the source's partials ring than the gate: 0 % = they close with it; 25 % = they ring down 15 dB; 50 % = 30 dB; 100 % = 60 dB. Never into the bleed floor, and the wash stays shut. |
+| **The view** | What it has learned from this track: the source's spectrum (violet), the bleed when the gate is shut (grey line), and the partials (amber lines). |
+
+How it learns: ~85 ms of each hit's body (from 10 ms after the hit) is analysed and averaged over hits;
+its partials are the real peaks in it (the spectrum drops at least 9 dB on both sides within a third of an
+octave, so a bump in cymbal noise isn't one), up to 8, at least 1/6 octave apart, within 30 dB of the
+strongest and 10 dB above the bleed. The bleed floors use minimum tracking, so a source tail still ringing
+when the gate shuts isn't mistaken for bleed. New partials switch in on the next hit's attack.
+Up to Phase 4's pitch tracking, the partials are fixed frequencies (a tom's pitch glide is covered by their
+width).
 
 ### Micro Glow (on/off)
 
@@ -76,6 +108,15 @@ On/Off and Type changes crossfade (5 / 10 ms). Off is bit-exact. The 1 ms of lat
 source confidence and which instance claimed it.
 
 ## Measured (offline tests, `tests/test_engine.cpp`, `tests/test_processor.cpp`)
+
+Phase 3, on a simulated tom mic (`tests/DrumSim.h`: a 110 Hz tom with membrane overtones and pitch glide,
+plus hi-hat, snare and crash bleed, some crashes landing on the same instant as a tom hit):
+- Every tom found (20 of 20) and nothing else: no hats, snare or gate wobble counted as a hit.
+- Partials learned from the bleed-laden track: 111, 179, 244, 297 Hz (the tom's 1, 1.59, 2.14/2.30, 2.65/2.92 modes; close pairs merge). None in the bleed's range.
+- Cymbal and hat wash in the tail (20–400 ms, >4 kHz) vs the plain gate: −18 dB at Focus 50, −33 dB at 80, −37 dB at 100, the same on toms with a crash right on them. Tom body (60–400 Hz): −0.3 dB.
+- Sustain, with a gate that closes in the tail (toms 1.5 s apart, 60 ms release): the plain gate cuts the tom's ring by 9.5 dB (300–900 ms) and to silence after 700 ms; Sustain 25 % brings it back to −1.5 dB, 50 % −0.2 / −1.3 dB, 100 % −0.2 / −0.9 dB of the natural ring. The hat wash stays 42–55 dB under the raw hats throughout.
+- Focus 0 + Sustain 0 is bit-identical to the plain gate; the first 5 ms of every hit always is.
+- A stroke reopening the rest steps no harder than the plain gate does. Identical output for any block size; no allocations on the audio thread (the analysis FFT runs there, ~40 µs once per hit).
 
 Phase 2:
 - Leveler, fixed target: every hit lands within 0.000 dB of where Amount/Max say it should (10 hits spread over 21 dB).
@@ -126,10 +167,11 @@ strictness 10, then the **latest** release plus a permanent version release with
 ## Files
 
 - `Source/GateCore.h`: the whole audio path (detector, filters, tracking, onsets, envelope, leveler, lookahead, meters). Plain C++, shared with the tests.
+- `Source/SpectralDecay.h`: the spectral decay (learning, partial filters, tail gains). `Source/Svf.h`: the filters.
 - `Source/MicroGlow.h`: Micro Glow (Glow's Tube and Iron, envelope follower, auto gain, oversampling). `Source/GlowDriveMap.h` is Glow's Drive map, copied verbatim; `Source/HalfbandCoeffs.h` is generated by `tools/design_halfband.py`.
 - `Source/HitRecord.h`: the hit record every feature reads and writes.
 - `Source/SpscFifo.h`: lock-free audio → UI queue.
 - `Source/Params.h`: parameter IDs (don't rename after release: it breaks sessions).
 - `Source/PluginProcessor.*`, `Source/PluginEditor.*`: JUCE wrapper and UI.
-- `tests/`: engine and plug-in tests.
+- `tests/`: engine and plug-in tests; `tests/DrumSim.h` the simulated tom mic.
 - The plug-in code is `Gate` (manufacturer `Nrka`): keep it forever.

@@ -6,6 +6,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "DrumSim.h"
 #include <random>
 
 using namespace juce;
@@ -42,25 +43,23 @@ int main (int argc, char** argv)
     set (tg::pid::glowOn, 1.0f);
     set (tg::pid::glowDrive, 35.0f);
     set (tg::pid::glowEnv, 60.0f);
+    set (tg::pid::specOn, 1.0f);
+    set (tg::pid::specFocus, 70.0f);
+    set (tg::pid::specSustain, 40.0f);
     p.prepareToPlay (sr, 256);
 
-    // 3 s: tom hits (loud and soft) with quieter snare bleed hits in between, plus a noise floor
-    const int n = (int) (sr * 3.2);
+    // the simulated tom mic (tests/DrumSim.h): toms with hats, snare and crashes bleeding in
+    auto ses = sim::tomMicSession (sr, 14);
+    const int n = (int) ses.mix.size();
     AudioBuffer<float> sig (2, n);
-    sig.clear();
-    std::mt19937 rng (4);
-    std::uniform_real_distribution<float> u (-1.0f, 1.0f);
-    for (int i = 0; i < n; ++i) { const float v = 0.004f * u (rng); sig.setSample (0, i, v); sig.setSample (1, i, v); }
-    const int toms[] = { 6000, 30000, 52000, 75000, 96000, 120000, 138000 };
-    const float tAmp[] = { 0.8f, 0.5f, 0.85f, 0.3f, 0.7f, 0.9f, 0.45f };
-    for (int k = 0; k < 7; ++k) addHit (sig, toms[k], tAmp[k], 110.0f, sr, 90.0f, (unsigned) k);
-    for (int at = 18000; at < n; at += 24000) addHit (sig, at, 0.03f, 220.0f, sr, 40.0f, (unsigned) at);
+    for (int i = 0; i < n; ++i) { sig.setSample (0, i, ses.mix[(size_t) i]); sig.setSample (1, i, ses.mix[(size_t) i]); }
 
     std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
     ed->setVisible (true);
     MidiBuffer midi;
     AudioBuffer<float> blk (4, 256);
-    for (int pos = 0; pos + 256 <= n; pos += 256)
+    const int end = n - (int) (2.4 * sr);   // stop mid-session, so the view shows several hits
+    for (int pos = 0; pos + 256 <= end; pos += 256)
     {
         blk.clear();
         for (int c = 0; c < 2; ++c) blk.copyFrom (c, 0, sig, c, pos, 256);
@@ -71,7 +70,10 @@ int main (int argc, char** argv)
                 if (auto* gd = dynamic_cast<GateDisplay*> (c)) gd->pull();
     }
     for (auto* c : ed->getChildren())
+    {
         if (auto* gd = dynamic_cast<GateDisplay*> (c)) gd->pull();
+        if (auto* sv = dynamic_cast<SpectrumView*> (c)) sv->pull();
+    }
 
     auto img = ed->createComponentSnapshot (ed->getLocalBounds(), true, 2.0f);
     File out (argc > 1 ? String (argv[1]) : String ("snapshot.png"));

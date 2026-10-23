@@ -65,6 +65,11 @@ AudioProcessorValueTreeState::ParameterLayout TheGateProcessor::createLayout()
     ps.push_back (std::make_unique<P> (ParameterID { tg::pid::glowEnv, 1 }, "Glow Envelope", NormalisableRange<float> (-100.0f, 100.0f, 0.1f), 0.0f,
                                        A().withLabel ("%").withStringFromValueFunction ([] (float v, int)
                                            { return (v > 0.05f ? "+" : "") + String (roundToInt (v)) + " %"; })));
+
+    // Spectral decay
+    ps.push_back (std::make_unique<AudioParameterBool> (ParameterID { tg::pid::specOn, 1 }, "Spectral Decay", false));
+    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::specFocus, 1 }, "Spectral Focus", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 60.0f, pct));
+    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::specSustain, 1 }, "Spectral Sustain", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f, pct));
     return { ps.begin(), ps.end() };
 }
 
@@ -96,6 +101,9 @@ TheGateProcessor::TheGateProcessor()
     raw.glowType    = apvts.getRawParameterValue (tg::pid::glowType);
     raw.glowDrive   = apvts.getRawParameterValue (tg::pid::glowDrive);
     raw.glowEnv     = apvts.getRawParameterValue (tg::pid::glowEnv);
+    raw.specOn      = apvts.getRawParameterValue (tg::pid::specOn);
+    raw.specFocus   = apvts.getRawParameterValue (tg::pid::specFocus);
+    raw.specSustain = apvts.getRawParameterValue (tg::pid::specSustain);
 
     engine.prepare (48000.0, 2);
     startTimerHz (10);
@@ -142,6 +150,9 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.glow.type      = jlimit (0, 1, (int) raw.glowType->load());
     s.glow.drive     = raw.glowDrive->load();
     s.glow.envAmount = raw.glowEnv->load();
+    s.spectral.on      = raw.specOn->load() > 0.5f;
+    s.spectral.focus   = raw.specFocus->load();
+    s.spectral.sustain = raw.specSustain->load();
     return s;
 }
 

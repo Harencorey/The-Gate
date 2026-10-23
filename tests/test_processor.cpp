@@ -117,6 +117,9 @@ static void testStateRoundTrip()
     setParam (a, tg::pid::glowType, 1.0f);
     setParam (a, tg::pid::glowDrive, 63.0f);
     setParam (a, tg::pid::glowEnv, -40.0f);
+    setParam (a, tg::pid::specOn, 1.0f);
+    setParam (a, tg::pid::specFocus, 85.0f);
+    setParam (a, tg::pid::specSustain, 35.0f);
     MemoryBlock mb;
     a.getStateInformation (mb);
     TheGateProcessor b;

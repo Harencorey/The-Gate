@@ -10,11 +10,15 @@
 //        hysteresis -> state delay (so the attack ramp ends exactly on the transient)
 //        -> gain envelope (attack / hold / release / range)
 //
-//   audio -> lookahead delay -> x gate gain x leveler gain -> Micro Glow -> out
+//   audio -> lookahead delay -> x gate gain (or the spectral decay) x leveler gain -> Micro Glow -> out
 //                                                    (Listen: the filtered key, Micro Glow skipped)
 //
-// Hits: a hit starts when the gate opens, or - while it's open - when the key jumps 6 dB up
-// from where it had decayed to (a new stroke in a roll, a flam). Every hit gets a Hit record.
+// Hits: a hit starts when the gate opens, or - while it's open - with each new stroke (a roll,
+// a flam): a sharp edge in the key that also lifts its peak 4 dB over the ringing tail, or a
+// 6 dB jump in its level (which still works under cymbal wash). A hi-hat tick riding on a tom's
+// tail isn't a stroke; neither is a ghost note buried less than ~4 dB above a still-ringing hit
+// (Phases 4 and 6 sort those out by what the sound is and which mic claims it).
+// Every hit gets a Hit record.
 //
 // Leveler: each hit's audio peak is measured during the lookahead, before the hit reaches
 // the output, and a gain for that hit is set so the hit lands nearer the target. The gain
@@ -30,6 +34,8 @@
 #include "HitRecord.h"
 #include "SpscFifo.h"
 #include "MicroGlow.h"
+#include "Svf.h"
+#include "SpectralDecay.h"
 
 #include <algorithm>
 #include <cmath>
@@ -64,6 +70,9 @@ struct GateSettings
     // Micro Glow
     MicroGlow::Settings glow;
 
+    // Spectral decay
+    SpectralDecay::Settings spectral;
+
     static constexpr float kAutoTarget = -100.0f;
 };
 
@@ -77,36 +86,6 @@ struct MeterFrame
     bool  open    = false;  // detector state at this point
     bool  hit     = false;  // a hit's first sample is in this frame
     float hitChangeDb = 0.0f; // the leveler change for that hit
-};
-
-//------------------------------------------------------------------------------
-// Zavalishin/Simper TPT state-variable filter. Cheap to retune every few samples,
-// which is what the tracking high cut needs.
-struct Svf
-{
-    double ic1 = 0.0, ic2 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0, k = 1.414;
-
-    void setup (double fc, double fs, double q) noexcept
-    {
-        const double g = std::tan (M_PI * std::min (fc, 0.49 * fs) / fs);
-        k = 1.0 / q;
-        a1 = 1.0 / (1.0 + g * (g + k));
-        a2 = g * a1;
-        a3 = g * a2;
-    }
-    void reset() noexcept { ic1 = ic2 = 0.0; }
-
-    // returns lowpass; highpass via the out-param
-    inline double tick (double x, double& hp) noexcept
-    {
-        const double v3 = x - ic2;
-        const double v1 = a1 * ic1 + a2 * v3;
-        const double v2 = ic2 + a2 * ic1 + a3 * v3;
-        ic1 = 2.0 * v1 - ic1;
-        ic2 = 2.0 * v2 - ic2;
-        hp = x - k * v1 - v2;
-        return v2;
-    }
 };
 
 // 4th-order Butterworth = two SVFs with these Qs
@@ -134,7 +113,10 @@ public:
         keyRing.assign (ringSize, 0.0f);
         levelRing.assign (ringSize, 0.0f);
         stateRing.assign (ringSize, 0);
+        onsetRing.assign (ringSize, 0);
+        keyAbsRing.assign (ringSize, 0.0f);
         glow.prepare (sr, numCh);
+        spectral.prepare (sr, numCh);
         reset();
     }
 
@@ -144,6 +126,8 @@ public:
         std::fill (keyRing.begin(), keyRing.end(), 0.0f);
         std::fill (levelRing.begin(), levelRing.end(), 0.0f);
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
+        std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
+        spectral.reset();
         writePos = 0;
         clock = 0;
         for (auto* f : { &hpf1, &hpf2, &lpf1, &lpf2 }) f->reset();
@@ -163,6 +147,9 @@ public:
         onsetPeak = onsetValley = 0.0;
         lastOnset = riseStart = 0;
         prevKf = slopeEnv = prevSlopeEnv = 0.0;
+        candActive = false; candT0 = 0;
+        jumpPow = prevJumpEnv = lvlPeak = lvlValley = 0.0; levelRiseStart = lastEdge = lastJump = closedAt = 0;
+        std::fill (keyAbsRing.begin(), keyAbsRing.end(), 0.0f);
         haveOnset = false;
         numPending = 0;
         lvlGain = lvlFrom = lvlTo = 1.0;
@@ -193,6 +180,7 @@ public:
         gFloorTarget = dbToGain (s.rangeDb);
         laTarget = lookaheadSamples (s.lookaheadMs);
         glow.setSettings (s.glow);
+        spectral.setSettings (s.spectral, s.releaseMs, s.rangeDb);
     }
 
     int lookaheadSamples (float ms) const noexcept
@@ -219,6 +207,9 @@ public:
         const int hitWindowSamples = std::max (1, (int) std::lround (0.010 * sr));
         const uint64_t minGap = (uint64_t) std::lround (0.015 * sr);
         const uint64_t maxBackdate = (uint64_t) std::lround (0.003 * sr);
+        const int afterLen = std::max (1, (int) std::lround (0.001 * sr)), beforeLen = (int) std::lround (0.010 * sr);
+        const uint64_t reopenGap = (uint64_t) std::lround (0.050 * sr), recentLen = (uint64_t) std::lround (0.005 * sr);
+        const double jumpCoef = std::exp (-1.0 / (0.008 * sr));
         const double slopeRel = std::exp (-1.0 / (0.005 * sr));
         const int oneMs = std::max (1, (int) std::lround (0.001 * sr));
         // Leveler timing (see the header): measure for W samples, glide for G, finish P before the hit
@@ -296,25 +287,79 @@ public:
             }
             if (slopeEnv <= prevSlopeEnv) riseStart = clock;
             prevSlopeEnv = slopeEnv;
-            bool onset = detectorOpen && ! wasOpen;
+            // a smooth level for spotting strokes by their jump: 8 ms RMS (ripples < 0.5 dB on a
+            // 110 Hz tom, where the peak follower ripples ~8 dB every cycle)
+            jumpPow = kf * kf + (jumpPow - kf * kf) * jumpCoef;
+            const double jumpEnv = std::sqrt (jumpPow);
+            if (jumpEnv <= prevJumpEnv) levelRiseStart = clock;
+            prevJumpEnv = jumpEnv;
+            // edges and jumps are tracked all the time (also while the gate is shut)
+            const bool edge = slopeEnv > 4.0 * onsetValley && onsetValley < 0.25 * onsetPeak;
+            const bool jump = jumpEnv > 2.0 * lvlValley && lvlValley < 0.5 * lvlPeak;
+            if (edge) lastEdge = clock;
+            if (jump) lastJump = clock;
+            if (! detectorOpen && wasOpen) closedAt = clock;
+
+            // The gate opening is a hit - unless it's the same note wobbling back over the
+            // threshold: reopening within 50 ms of closing, with no edge or jump in the last 5 ms
+            // (close overtones beating in a decaying tom make its level wobble by several dB).
+            bool onset = detectorOpen && ! wasOpen
+                         && (! haveOnset || clock - closedAt >= reopenGap
+                             || clock - lastEdge <= recentLen || clock - lastJump <= recentLen);
+            // backdated start: where the rise began (at most 3 ms, and never before the last hit)
+            auto backdate = [&] (uint64_t rs)
+            {
+                uint64_t t = std::max (rs + 1 <= clock ? rs + 1 : clock, clock >= maxBackdate ? clock - maxBackdate : 0);
+                return haveOnset ? std::max (t, lastOnset + 1) : t;
+            };
+            uint64_t t0 = backdate (riseStart);
             if (detectorOpen && wasOpen)
             {
-                // test against the valley/peak so far, THEN update them (a stroke louder than the
-                // last one would otherwise reset the valley before its own jump is seen)
-                if (slopeEnv > 4.0 * onsetValley && onsetValley < 0.25 * onsetPeak
-                    && (! haveOnset || clock - lastOnset >= minGap))
-                    onset = true;
-                if (slopeEnv > onsetPeak)          { onsetPeak = slopeEnv; onsetValley = slopeEnv; }
-                else if (slopeEnv < onsetValley)   onsetValley = slopeEnv;
+                // A new stroke while the gate is open shows up as a sharp edge (the key's slope
+                // jumps 12 dB) or, under cymbal wash that hides the edge, as a 6 dB jump in the
+                // smooth level. An edge is only a CANDIDATE: the biggest swing in the 1 ms after it
+                // must be 4 dB above the biggest in the 10 ms before (at least a full cycle of the
+                // ringing tail). A real stroke does; a hi-hat tick riding on a tom's ringing tail
+                // has the edge but hardly raises the peak.
+                // (Test against the valley/peak so far, THEN update them: a stroke louder than the
+                // last one would otherwise reset the valley before its own jump is seen.)
+                if (jump && (! haveOnset || clock - lastOnset >= minGap))
+                {
+                    onset = true;   // a 6 dB jump in the smooth level is a stroke by itself
+                    t0 = candActive ? std::min (candT0, backdate (levelRiseStart)) : backdate (levelRiseStart);
+                    candActive = false;
+                }
+                else if (! candActive && edge && (! haveOnset || clock - lastOnset >= minGap))
+                {
+                    candActive = true; candT0 = t0;
+                    onsetPeak = onsetValley = slopeEnv;
+                }
+                if (candActive && ! onset && clock + 1 >= candT0 + (uint64_t) afterLen)
+                {
+                    // biggest swing in [t0, t0 + 1 ms) vs in [t0 - 10 ms, t0), from the delay line
+                    double after = std::abs (kf), before = 0.0;
+                    for (uint64_t c0 = candT0; c0 < clock; ++c0) after = std::max (after, (double) keyAbsRing[(size_t) c0 & ringMask]);
+                    const uint64_t b0 = candT0 >= (uint64_t) beforeLen ? candT0 - (uint64_t) beforeLen : 0;
+                    for (uint64_t c0 = b0; c0 < candT0; ++c0) before = std::max (before, (double) keyAbsRing[(size_t) c0 & ringMask]);
+                    if (after >= 1.585 * before) { onset = true; t0 = candT0; }
+                    candActive = false;
+                }
             }
+            else candActive = false;
+            if (slopeEnv > onsetPeak)          { onsetPeak = slopeEnv; onsetValley = slopeEnv; }
+            else if (slopeEnv < onsetValley)   onsetValley = slopeEnv;
+            if (jumpEnv > lvlPeak)             { lvlPeak = jumpEnv; lvlValley = jumpEnv; }
+            else if (jumpEnv < lvlValley)      lvlValley = jumpEnv;
+            keyAbsRing[writePos] = (float) std::abs (kf);
             if (onset)
             {
                 onsetPeak = onsetValley = slopeEnv;
-                // backdate to where the rise began (at most 3 ms, and never before the last hit)
-                uint64_t t0 = std::max (riseStart + 1 <= clock ? riseStart + 1 : clock, clock >= maxBackdate ? clock - maxBackdate : 0);
-                if (haveOnset) t0 = std::max (t0, lastOnset + 1);
+                lvlPeak = lvlValley = jumpEnv;
                 lastOnset = t0;
                 haveOnset = true;
+                // mark where the hit lands on the output timeline (or now, if that's already passed)
+                const uint64_t outNow = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
+                onsetRing[(size_t) (std::max (t0, outNow) & (uint64_t) ringMask)] = 1;
                 if (numPending < kMaxPending)
                 {
                     auto& pd = pending[numPending++];
@@ -427,9 +472,19 @@ public:
             else if (lvlUser > userT) lvlUser = std::max (userT, lvlUser - lvlStepOff);
             const double lg = lvlUser >= 1.0 ? lvlGain : (lvlUser <= 0.0 ? 1.0 : 1.0 + lvlUser * (lvlGain - 1.0));
 
-            //---------------- output
+            //---------------- output: the gate (or the spectral decay) x leveler
             const float gf = (float) g * laFadeGain;
             const float lf = (float) lg;
+            const bool onsetNow = onsetRing[rAudio] != 0;
+            onsetRing[rAudio] = 0;
+            const int attackN = (int) attackSamples;
+            const int peek = la > 0 ? std::min (attackN, la) : 0;
+            const bool onsetAhead = peek > 0 && onsetRing[(rAudio + (size_t) peek) & ringMask] != 0;
+            const bool gateClosed = stateRing[rAudio] == 0 && g <= gFloor + 1e-9;
+            float gated[kMaxChannels];
+            for (int c = 0; c < numChannels; ++c) gated[c] = audioRing[(size_t) c * ringSize + rAudio];
+            // x * gate gain when the spectral decay is off (bit-exact), its shaped tail when on
+            spectral.tick (gated, numChannels, gf, (float) gFloor * laFadeGain, onsetNow, onsetAhead, attackN, gateClosed);
             if (s.listen)
             {
                 const float kOut = keyRing[rAudio] * laFadeGain;
@@ -438,10 +493,7 @@ public:
             else
             {
                 for (int c = 0; c < numChannels; ++c)
-                {
-                    const float x = audioRing[(size_t) c * ringSize + rAudio];
-                    glowFrame[c] = (x * gf) * lf;   // x * 1.0f is exact: bit-identical when fully open
-                }
+                    glowFrame[c] = gated[c] * lf;   // gated = x * 1.0f is exact: bit-identical when fully open
             }
             glow.tick (glowFrame, numChannels, s.listen);
             for (int c = 0; c < numChannels; ++c) io[c][i] = glowFrame[c];
@@ -497,6 +549,7 @@ public:
     double currentLevelerGain() const noexcept { return lvlGain; }
     float glowModulatedDrive() const noexcept { return glow.modulatedDrive(); }
     float glowAutoGainDb() const noexcept { return glow.autoGainDb(); }
+    SpectralDecay& spectralDecay() noexcept { return spectral; }   // learned partials, UI snapshots
 
 private:
     static double dbToGain (double db) noexcept { return db <= kFullyShutDb ? 0.0 : std::pow (10.0, db / 20.0); }
@@ -578,7 +631,7 @@ private:
     int numCh = 2;
 
     std::vector<float>   audioRing, keyRing, levelRing;
-    std::vector<uint8_t> stateRing;
+    std::vector<uint8_t> stateRing, onsetRing;
     size_t ringSize = 1, ringMask = 0, writePos = 0;
     uint64_t clock = 0;
 
@@ -598,6 +651,11 @@ private:
     double onsetPeak = 0.0, onsetValley = 0.0;
     uint64_t lastOnset = 0, riseStart = 0;
     double prevKf = 0.0, slopeEnv = 0.0, prevSlopeEnv = 0.0;
+    double jumpPow = 0.0, prevJumpEnv = 0.0, lvlPeak = 0.0, lvlValley = 0.0;
+    uint64_t levelRiseStart = 0, lastEdge = 0, lastJump = 0, closedAt = 0;
+    std::vector<float> keyAbsRing;   // |key| per sample (for confirming strokes)
+    bool candActive = false;
+    uint64_t candT0 = 0;
     bool haveOnset = false;
 
     // leveler
@@ -608,6 +666,7 @@ private:
     float lvlMarkDb = 0.0f;
 
     MicroGlow glow;
+    SpectralDecay spectral;
 
     double g = 0.0, gFloor = 0.0, gFloorTarget = 0.0, floorCoef = 0.0;
     double attackSamples = 24.0, attackFrom = 0.0, attackPhase = 0.0, releaseCoef = 0.999;

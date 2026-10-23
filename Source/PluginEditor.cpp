@@ -219,6 +219,68 @@ void GateDisplay::paint (Graphics& g)
 }
 
 //==============================================================================
+void SpectrumView::pull()
+{
+    tg::SpectrumSnapshot s;
+    bool got = false;
+    while (proc.engine.spectralDecay().snapshots.pop (s)) got = true;
+    if (got) { snap = s; have = true; repaint(); }
+}
+
+void SpectrumView::paint (Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    g.setColour (colours::bg);
+    g.fillRoundedRectangle (r, 4.0f);
+    auto plot = r.reduced (4.0f, 6.0f);
+    plot.removeFromBottom (10.0f);
+    using S = tg::SpectrumSnapshot;
+    auto xFor = [&] (float hz) { return plot.getX() + plot.getWidth() * std::log (hz / S::kMinHz) / std::log (S::kMaxHz / S::kMinHz); };
+    g.setFont (FontOptions (9.0f));
+    for (float hz : { 100.0f, 1000.0f, 10000.0f })
+    {
+        g.setColour (colours::edge);
+        g.drawVerticalLine ((int) xFor (hz), plot.getY(), plot.getBottom());
+        g.setColour (colours::dim.withAlpha (0.7f));
+        g.drawText (hz >= 1000 ? String ((int) (hz / 1000)) + "k" : String ((int) hz), Rectangle<float> (xFor (hz) - 14, plot.getBottom(), 28, 10), Justification::centred);
+    }
+    if (! have || snap.hitsLearned < 2)
+    {
+        g.setColour (colours::dim);
+        g.setFont (FontOptions (11.0f));
+        g.drawText (have ? "learning... (" + String (snap.hitsLearned) + " hits)" : "learns from the first hits", plot, Justification::centred);
+        return;
+    }
+    float top = -300.0f;
+    for (int i = 0; i < S::kPoints; ++i) top = jmax (top, snap.sourceDb[i]);
+    auto yFor = [&] (float db) { return plot.getY() + plot.getHeight() * jlimit (0.0f, 1.0f, (top - db) / 60.0f); };
+    auto hzAt = [&] (int i) { return S::kMinHz * std::pow (S::kMaxHz / S::kMinHz, (i + 0.5f) / S::kPoints); };
+    Path src, bl;
+    src.startNewSubPath (plot.getX(), plot.getBottom());
+    for (int i = 0; i < S::kPoints; ++i) src.lineTo (xFor (hzAt (i)), yFor (snap.sourceDb[i]));
+    src.lineTo (plot.getRight(), plot.getBottom());
+    src.closeSubPath();
+    g.setColour (colours::level.withAlpha (0.35f));
+    g.fillPath (src);
+    if (snap.bleedLearned)
+    {
+        for (int i = 0; i < S::kPoints; ++i)
+        {
+            const Point<float> p (xFor (hzAt (i)), yFor (snap.bleedDb[i]));
+            if (i == 0) bl.startNewSubPath (p); else bl.lineTo (p);
+        }
+        g.setColour (colours::dim);
+        g.strokePath (bl, PathStrokeType (1.2f));
+    }
+    g.setColour (colours::accent);
+    for (int k = 0; k < snap.numPartials; ++k)
+    {
+        const float x = xFor (snap.partials[k].hz);
+        g.drawLine (x, plot.getY(), x, plot.getBottom(), 1.5f);
+    }
+}
+
+//==============================================================================
 ConcentricKnob::ConcentricKnob (AudioProcessorValueTreeState& apvts, const char* knobId, const char* ringId,
                                 const String& kn, const String& rn, const String& knobTip, const String& ringTip)
     : knobName (kn), ringName (rn)
@@ -292,7 +354,8 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     : AudioProcessorEditor (&p), proc (p), display (p),
       glowDrive (p.apvts, tg::pid::glowDrive, tg::pid::glowEnv, "DRIVE", "ENV",
                  "DRIVE (center knob): how hard Micro Glow is hit, on Glow's Drive scale. The output is loudness-matched, so this changes the color and density, not the level. Double-click: 25.",
-                 "ENV (outer ring): the envelope follower. Hits that rise above the track's own average push Drive up (right of center) or pull it back (left), always returning to the knob setting. The violet dot on the knob shows where Drive is right now. Double-click: off.")
+                 "ENV (outer ring): the envelope follower. Hits that rise above the track's own average push Drive up (right of center) or pull it back (left), always returning to the knob setting. The violet dot on the knob shows where Drive is right now. Double-click: off."),
+      spectrum (p)
 {
     setLookAndFeel (&look);
     { tg::MeterFrame f; while (proc.engine.meters.pop (f)) {} }   // drop frames queued while the window was closed
@@ -314,6 +377,10 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     makeKnob (levelTarget, tg::pid::levelTarget, "TARGET", "The peak level hits are evened towards. Bottom = Auto: the running average of the last few hits, so the overall level stays put and only the hit-to-hit differences shrink.");
     makeKnob (levelMax,    tg::pid::levelMax,    "MAX",    "The most any single hit is turned up or down.");
     addAndMakeVisible (glowDrive);
+    addAndMakeVisible (spectrum);
+    makeKnob (specFocus,   tg::pid::specFocus,   "FOCUS",   "How fast everything that isn't the source closes in the tail: cymbal wash, hats, snare buzz, room. 0 % = like the plain gate; 100 % = gone almost straight after the attack, leaving the source's own partials.");
+    makeKnob (specSustain, tg::pid::specSustain, "SUSTAIN", "How much longer the source's own partials ring than the gate: 0 % = they close with the gate; 50 % = they ring 30 dB down; 100 % = 60 dB, never into the bleed. The wash stays shut.");
+    spectrum.setTooltip ("What the spectral decay has learned from this track: the source (violet), the bleed when the gate is shut (grey line) and the source's partials (amber), the resonances that ring in the tail.");
     makeChoice (glowType, tg::pid::glowType, "TYPE", "TUBE: Glow's tube output stage: the whole sound thickens, softer and rounder as Drive goes up. IRON: Glow's transformer: only the lows (below ~126 Hz) saturate and compress; mids and highs pass clean.");
 
     auto setupOn = [this] (TextButton& b, const char* id, std::unique_ptr<AudioProcessorValueTreeState::ButtonAttachment>& att, const String& tip)
@@ -324,6 +391,7 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
         att = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, id, b);
     };
     setupOn (levelerOn, tg::pid::levelerOn, levelerOnAtt, "Leveler on/off. Evens out soft and loud hits: each hit's peak is measured during the lookahead and its gain set before it plays, so transients are never ramped. Works best with 5 ms lookahead or more.");
+    setupOn (specOn,    tg::pid::specOn,    specOnAtt,    "Spectral decay on/off. The attack stays exactly the plain gate; in the tail, the source's own partials (learned from its hits) ring and everything else closes faster. Zero latency, no phase shift.");
     setupOn (glowOn,    tg::pid::glowOn,    glowOnAtt,    "Micro Glow on/off: Glow's saturation at the output, after the gate and leveler. Oversampled to ~384 kHz, linear-phase, loudness-matched. Switching it never changes the latency.");
 
     listen.setClickingTogglesState (true);
@@ -331,7 +399,7 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     addAndMakeVisible (listen);
     listenAtt = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, tg::pid::listen, listen);
 
-    setSize (820, 632);
+    setSize (980, 632);
     startTimerHz (30);
 }
 
@@ -375,6 +443,10 @@ void TheGateEditor::timerCallback()
     const float lvl = levelerOn.getToggleState() ? 1.0f : 0.4f, glw = glowOn.getToggleState() ? 1.0f : 0.4f;
     for (auto* k : { &levelAmount, &levelTarget, &levelMax }) { k->slider.setAlpha (lvl); k->label.setAlpha (lvl); }
     glowDrive.setAlpha (glw);
+    const float spc = specOn.getToggleState() ? 1.0f : 0.4f;
+    for (auto* k : { &specFocus, &specSustain }) { k->slider.setAlpha (spc); k->label.setAlpha (spc); }
+    spectrum.setAlpha (spc);
+    spectrum.pull();
     glowType.box.setAlpha (glw); glowType.label.setAlpha (glw);
     glowDrive.setModulated (proc.engine.glowModulatedDrive());
 }
@@ -391,7 +463,7 @@ void TheGateEditor::paint (Graphics& g)
     g.drawText ("NORKA DSP   v" + String (JucePlugin_VersionString), header, Justification::centredRight);
 
     for (auto [area, title] : { std::pair { detectArea, "DETECT" }, std::pair { envArea, "ENVELOPE" }, std::pair { keyArea, "KEY FILTERS" },
-                                std::pair { levelArea, "LEVELER" }, std::pair { glowArea, "MICRO GLOW" } })
+                                std::pair { levelArea, "LEVELER" }, std::pair { specArea, "SPECTRAL DECAY" }, std::pair { glowArea, "MICRO GLOW" } })
     {
         g.setColour (colours::panel);
         g.fillRoundedRectangle (area.toFloat(), 6.0f);
@@ -419,9 +491,9 @@ void TheGateEditor::resized()
     auto row = r.removeFromTop (210);
     r.removeFromTop (8);
     auto row2 = r;
-    detectArea = row.removeFromLeft (230);
+    detectArea = row.removeFromLeft (270);
     row.removeFromLeft (8);
-    envArea = row.removeFromLeft (310);
+    envArea = row.removeFromLeft (360);
     row.removeFromLeft (8);
     keyArea = row;
 
@@ -464,10 +536,20 @@ void TheGateEditor::resized()
         listen.setBounds (bottom.removeFromTop (24).reduced (10, 0));
     }
 
-    levelArea = row2.removeFromLeft (row2.getWidth() / 2 - 4);
+    levelArea = row2.removeFromLeft (290);
+    row2.removeFromLeft (8);
+    specArea = row2.removeFromLeft (352);
     row2.removeFromLeft (8);
     glowArea = row2;
     levelerOn.setBounds (levelArea.getRight() - 54, levelArea.getY() + 6, 44, 20);
+    specOn.setBounds (specArea.getRight() - 54, specArea.getY() + 6, 44, 20);
+    {
+        auto a = specArea.reduced (8).withTrimmedTop (22);
+        auto knobs = a.removeFromLeft (172);
+        auto cols = columns (knobs.removeFromTop (120), 2);
+        placeKnob (specFocus, cols[0]); placeKnob (specSustain, cols[1]);
+        spectrum.setBounds (a.withTrimmedLeft (4).withTrimmedBottom (4));
+    }
     glowOn.setBounds (glowArea.getRight() - 54, glowArea.getY() + 6, 44, 20);
     {
         auto a = levelArea.reduced (8).withTrimmedTop (22);

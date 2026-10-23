@@ -22,6 +22,20 @@ private:
 };
 
 //==============================================================================
+// What the spectral decay has learned: the source's spectrum, the bleed's, and the partials.
+class SpectrumView : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit SpectrumView (TheGateProcessor& p) : proc (p) {}
+    void pull();   // UI thread: newest snapshot from the engine
+    void paint (juce::Graphics&) override;
+private:
+    TheGateProcessor& proc;
+    tg::SpectrumSnapshot snap;
+    bool have = false;
+};
+
+//==============================================================================
 // A concentric pot: the main knob in the middle, a second control as a ring around it.
 // The ring only takes the mouse on the ring itself, so the two never get in each other's way.
 class ConcentricKnob : public juce::Component
@@ -91,14 +105,15 @@ private:
     GateDisplay display;
 
     Knob threshold, hysteresis, attack, hold, release, range, keyHpf, keyHighCut, tracking;
-    Knob levelAmount, levelTarget, levelMax;
+    Knob levelAmount, levelTarget, levelMax, specFocus, specSustain;
     ConcentricKnob glowDrive;
+    SpectrumView spectrum;
     Choice lookahead, keySource, glowType;
-    juce::TextButton listen { "LISTEN KEY" }, levelerOn { "ON" }, glowOn { "ON" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> listenAtt, levelerOnAtt, glowOnAtt;
+    juce::TextButton listen { "LISTEN KEY" }, levelerOn { "ON" }, glowOn { "ON" }, specOn { "ON" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> listenAtt, levelerOnAtt, glowOnAtt, specOnAtt;
     juce::TooltipWindow tooltips { this, 3000 };
 
-    juce::Rectangle<int> detectArea, envArea, keyArea, levelArea, glowArea;
+    juce::Rectangle<int> detectArea, envArea, keyArea, levelArea, specArea, glowArea;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TheGateEditor)
 };

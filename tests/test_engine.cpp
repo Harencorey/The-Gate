@@ -5,6 +5,7 @@
 //==============================================================================
 
 #include "GateCore.h"
+#include "DrumSim.h"
 
 #include <atomic>
 #include <cmath>
@@ -228,6 +229,7 @@ static void testBlockSizeIndependence()
         s.externalKey = variant & 1; s.listen = variant == 2; s.lookaheadMs = variant == 3 ? 0.0f : 10.0f;
         s.levelerOn = true; s.levelTarget = variant == 1 ? -10.0f : tg::GateSettings::kAutoTarget;
         s.glow.on = variant != 2; s.glow.type = variant % 2; s.glow.drive = 60.0f; s.glow.envAmount = variant == 1 ? -70.0f : 80.0f;
+        s.spectral.on = variant != 3; s.spectral.focus = 70.0f; s.spectral.sustain = variant == 0 ? 80.0f : 30.0f;
         Buf a = run (in, s, sr, 512, &key);
         Buf b = run (in, s, sr, 0, &key, 99);
         Buf c = run (in, s, sr, 1, &key);
@@ -246,6 +248,7 @@ static void testNoAllocations()
     Buf in = makeDrumTrack (sr, n, 21), key = makeDrumTrack (sr, n, 22);
     tg::GateSettings s; s.keyHpfHz = 60.0f; s.trackingPct = 100.0f; s.externalKey = true;
     s.levelerOn = true; s.glow.on = true; s.glow.drive = 80.0f; s.glow.envAmount = 60.0f; s.glow.type = tg::MicroGlow::iron;
+    s.spectral.on = true; s.spectral.focus = 90.0f; s.spectral.sustain = 60.0f;
     tg::GateEngine e;
     e.prepare (sr, 2);
     run (in, s, sr, 0, &key, 5, &e, true);
@@ -513,7 +516,8 @@ static void testLevelerTransientUntouched()
     for (float laMs : { 2.0f, 5.0f, 10.0f, 20.0f })
     {
         Buf in = makeBuf (1, 48000);
-        const auto starts = makeHits (in[0], sr, { -3.0f, -21.0f, -6.0f }, 9000);   // loud, soft (+9 dB), loud (-6 dB)
+        // loud, soft (+9 dB), loud (-6 dB); 250 ms apart, so each tail has died away under the next hit
+        const auto starts = makeHits (in[0], sr, { -3.0f, -21.0f, -6.0f }, 12000);
         tg::GateSettings s = levelerSettings(); s.lookaheadMs = laMs;
         tg::GateEngine e;
         Buf out = run (in, s, sr, 0, nullptr, 7, &e);
@@ -848,6 +852,165 @@ static void testGlowSwitchingClickFree()
     CHECK (switching <= steady + 1.4 / 240.0 + 1e-4, "switching jump %.4f vs steady %.4f", switching, steady);
 }
 
+
+//==============================================================================
+// Phase 3: spectral decay (on the simulated tom mic, tests/DrumSim.h)
+//==============================================================================
+
+// energy (dB) of x in a band, summed over windows after each hit (output timeline: + off)
+static double bandEnergyDb (const std::vector<float>& x, const std::vector<size_t>& at, size_t off, double lo, double hi, double fromMs, double toMs, double sr)
+{
+    tg::Svf h1, h2, l1, l2; h1.setup (lo, sr, 0.5412); h2.setup (lo, sr, 1.3066); l1.setup (hi, sr, 0.5412); l2.setup (hi, sr, 1.3066);
+    std::vector<double> y (x.size());
+    for (size_t i = 0; i < x.size(); ++i) { double hp, d, v = x[i]; h1.tick (v, hp); h2.tick (hp, v); v = l1.tick (v, d); v = l2.tick (v, d); y[i] = v; }
+    double e = 0;
+    for (size_t a : at)
+        for (size_t i = a + off + (size_t) (fromMs * sr / 1000); i < std::min (x.size(), a + off + (size_t) (toMs * sr / 1000)); ++i) e += y[i] * y[i];
+    return 10 * std::log10 (e + 1e-30);
+}
+
+static tg::GateSettings tomGate()
+{
+    tg::GateSettings s; s.thresholdDb = -24; s.hysteresisDb = 6; s.holdMs = 30; s.releaseMs = 250; s.lookaheadMs = 5;
+    return s;
+}
+
+static void testSpectralNeutral()
+{
+    std::printf ("Spectral decay: Focus 0 + Sustain 0 is bit-identical to the plain gate; the attack always is\n");
+    const double sr = 48000;
+    auto ses = sim::tomMicSession (sr, 12);
+    Buf in = makeBuf (1, ses.mix.size()); in[0] = ses.mix;
+    tg::GateEngine eOff; Buf off = run (in, tomGate(), sr, 0, nullptr, 3, &eOff);
+    tg::GateSettings s = tomGate(); s.spectral.on = true; s.spectral.focus = 0; s.spectral.sustain = 0;
+    Buf neutral = run (in, s, sr, 0, nullptr, 3);
+    CHECK (neutral == off, "Focus 0 / Sustain 0 not bit-identical");
+    s.spectral.focus = 100; s.spectral.sustain = 100;
+    tg::GateEngine e; Buf on = run (in, s, sr, 0, nullptr, 3, &e);
+    std::vector<uint64_t> starts; tg::Hit h; while (e.hits.pop (h)) starts.push_back (h.timeSamples);
+    bool same = true; size_t diff = 0;
+    for (auto t : starts) for (size_t i = t; i < t + 240 && i < on[0].size(); ++i) { same &= on[0][i] == off[0][i]; diff += on[0][i] != off[0][i]; }
+    bool changed = false; for (size_t i = 0; i < on[0].size(); ++i) changed |= on[0][i] != off[0][i];
+    std::printf ("  %zu hits: first 5 ms of each identical to the plain gate (%zu samples differ); the tails differ: %s\n", starts.size(), diff, changed ? "yes" : "no");
+    CHECK (same, "attack differs from the plain gate");
+    CHECK (changed, "Focus 100 changed nothing");
+}
+
+static void testSpectralLearnsPartials()
+{
+    std::printf ("Spectral decay learns the tom's partials from the bleed-laden track (hats, snare, crashes)\n");
+    const double sr = 48000;
+    auto ses = sim::tomMicSession (sr, 20);
+    Buf in = makeBuf (1, ses.mix.size()); in[0] = ses.mix;
+    tg::GateSettings s = tomGate(); s.spectral.on = true;
+    tg::GateEngine e; run (in, s, sr, 0, nullptr, 3, &e);
+    auto& sp = e.spectralDecay();
+    int nh = 0, extra = 0; tg::Hit h;
+    while (e.hits.pop (h))
+    {
+        ++nh;
+        long best = 1L << 40; for (auto t : ses.toms) best = std::min (best, std::labs ((long) h.arrivalSample - (long) t));
+        if (best > 48) ++extra;
+    }
+    std::printf ("  %d hits for %zu toms (%d not a tom); partials:", nh, ses.toms.size(), extra);
+    bool f0 = false, f1 = false; int low = 0, high = 0;
+    for (int k = 0; k < sp.numLearnedPartials(); ++k)
+    {
+        const double hz = sp.partialHz (k);
+        std::printf (" %.0f", hz);
+        f0 |= std::abs (hz / 110.0 - 1.0) < 0.03;
+        f1 |= std::abs (hz / (110.0 * sim::kTomRatios[1]) - 1.0) < 0.03;
+        low += hz < 400; high += hz > 2000;
+    }
+    std::printf (" Hz (the tom: 110 Hz x 1, 1.59, 2.14/2.30, 2.65/2.92)\n");
+    CHECK (nh == (int) ses.toms.size() && extra == 0, "%d hits, %d not toms", nh, extra);
+    CHECK (f0 && f1, "fundamental / first overtone not learned");
+    CHECK (low >= 3 && high == 0, "%d partials below 400 Hz, %d above 2 kHz (bleed)", low, high);
+}
+
+static void testSpectralCleansTail()
+{
+    std::printf ("Spectral decay: cymbal and hat wash closes in the tail, the tom body stays (vs the plain gate, 20-400 ms)\n");
+    const double sr = 48000;
+    auto ses = sim::tomMicSession (sr, 30);
+    std::vector<size_t> plain, crashed (ses.crashedToms.begin() + 1, ses.crashedToms.end());
+    for (size_t k = 4; k < ses.toms.size(); ++k)
+        if (std::find (ses.crashedToms.begin(), ses.crashedToms.end(), ses.toms[k]) == ses.crashedToms.end()) plain.push_back (ses.toms[k]);
+    Buf in = makeBuf (1, ses.mix.size()); in[0] = ses.mix;
+    tg::GateEngine e0; Buf off = run (in, tomGate(), sr, 256, nullptr, 1, &e0);
+    const size_t L = (size_t) e0.currentLatency();
+    for (float focus : { 50.0f, 80.0f, 100.0f })
+    {
+        tg::GateSettings s = tomGate(); s.spectral.on = true; s.spectral.focus = focus;
+        Buf o = run (in, s, sr, 256);
+        for (int w = 0; w < 2; ++w)
+        {
+            const auto& at = w ? crashed : plain;
+            const double hf = bandEnergyDb (o[0], at, L, 4000, 16000, 20, 400, sr) - bandEnergyDb (off[0], at, L, 4000, 16000, 20, 400, sr);
+            const double body = bandEnergyDb (o[0], at, L, 60, 400, 20, 400, sr) - bandEnergyDb (off[0], at, L, 60, 400, 20, 400, sr);
+            std::printf ("  Focus %3.0f, %-24s: cymbal/hats (>4 kHz) %6.1f dB, tom body (60-400 Hz) %+.1f dB\n", focus, w ? "toms with a crash on them" : "toms", hf, body);
+            if (focus >= 80) CHECK (hf < -25.0, "Focus %.0f: wash only %.1f dB down", focus, hf);
+            CHECK (hf < -12.0, "Focus %.0f: wash only %.1f dB down", focus, hf);
+            CHECK (std::abs (body) < 1.0, "Focus %.0f: tom body moved %.1f dB", focus, body);
+        }
+    }
+}
+
+static void testSpectralSustain()
+{
+    std::printf ("Spectral decay Sustain: the tom's partials ring on past the gate, the wash doesn't\n");
+    const double sr = 48000;
+    const int nT = 14; const size_t n = (size_t) ((nT * 1.5 + 2) * sr);
+    std::vector<float> tom (n, 0.0f), bleed (n, 0.0f);
+    std::vector<size_t> at;
+    for (int k = 0; k < nT; ++k) { const size_t a = (size_t) ((0.3 + 1.5 * k) * sr); sim::addTom (tom, a, 0.9f, 110, sr, (unsigned) k); if (k >= 4) at.push_back (a); }
+    for (size_t a = (size_t) (0.05 * sr); a < n; a += (size_t) (0.25 * sr)) sim::addHat (bleed, a, 0.06f, sr, (unsigned) a);
+    Buf mix = makeBuf (1, n), tomOnly = makeBuf (1, n);
+    for (size_t i = 0; i < n; ++i) { mix[0][i] = tom[i] + bleed[i]; tomOnly[0][i] = tom[i]; }
+    tg::GateSettings base; base.thresholdDb = -18; base.hysteresisDb = 4; base.holdMs = 0; base.releaseMs = 60; base.lookaheadMs = 5;
+    tg::GateEngine e0; Buf off = run (mix, base, sr, 256, nullptr, 1, &e0);
+    const size_t L = (size_t) e0.currentLatency();
+    tg::GateSettings open = base; open.rangeDb = 0;
+    Buf natural = run (tomOnly, open, sr, 256);   // the tom's own ring, never gated
+    const double n1 = bandEnergyDb (natural[0], at, L, 60, 400, 300, 900, sr), n2 = bandEnergyDb (natural[0], at, L, 60, 400, 700, 1400, sr);
+    Buf bleedOnly = makeBuf (1, n); bleedOnly[0] = bleed;
+    const double rawWash = bandEnergyDb (bleedOnly[0], at, 0, 4000, 16000, 300, 1400, sr);   // the hats as the mic hears them
+    double prev = -1e9;
+    for (float sus : { 0.0f, 25.0f, 50.0f, 75.0f, 100.0f })
+    {
+        tg::GateSettings s = base; s.spectral.on = true; s.spectral.focus = 80; s.spectral.sustain = sus;
+        Buf o = sus < 0 ? off : run (mix, s, sr, 256);
+        const double b1 = bandEnergyDb (o[0], at, L, 60, 400, 300, 900, sr) - n1;
+        const double b2 = std::max (-99.0, bandEnergyDb (o[0], at, L, 60, 400, 700, 1400, sr) - n2);
+        const double hf = bandEnergyDb (o[0], at, L, 4000, 16000, 300, 1400, sr) - rawWash;
+        std::printf ("  Sustain %3.0f: tom ring vs its natural decay %+.1f dB (300-900 ms), %+.1f dB (700-1400 ms); hat wash vs the raw hats %.1f dB\n", sus, b1, b2, hf);
+        CHECK (b1 >= prev - 0.05, "Sustain %.0f rang less than a lower setting", sus);
+        CHECK (hf < -40.0, "Sustain %.0f let the wash through (%.1f dB vs raw)", sus, hf);
+        if (sus >= 100) CHECK (b1 > -1.0 && b2 > -3.0, "Sustain 100 ring %.1f / %.1f dB", b1, b2);
+        if (sus == 0)   CHECK (b2 < -60.0, "Sustain 0 still rang (%.1f dB)", b2);
+        prev = b1;
+    }
+}
+
+static void testSpectralRestRampClean()
+{
+    std::printf ("Spectral decay: when a stroke comes in, the closed rest ramps back up like the gate's attack (no clicks)\n");
+    const double sr = 48000;
+    const size_t n = (size_t) sr * 3;
+    Buf in = makeBuf (1, n), key = makeBuf (1, n);
+    std::mt19937 rng (2);
+    std::normal_distribution<float> g (0.0f, 1.0f);
+    for (size_t i = 0; i < n; ++i) in[0][i] = 0.3f * (float) std::sin (2 * M_PI * 3100 * i / sr) + 0.05f * g (rng);   // steady "rest" content
+    for (size_t a = 2400; a + 4800 < n; a += 7200) addHit (key[0], a, 0.8f, 150.0f, sr, 20.0f, (unsigned) a);          // strokes via the sidechain
+    auto worstJump = [&] (const Buf& o) { double w = 0; for (size_t i = 4800; i < n; ++i) w = std::max (w, (double) std::abs (o[0][i] - o[0][i - 1])); return w; };
+    tg::GateSettings s; s.externalKey = true; s.thresholdDb = -30; s.holdMs = 100; s.releaseMs = 300; s.rangeDb = -40;
+    const double plain = worstJump (run (in, s, sr, 0, &key));
+    s.spectral.on = true; s.spectral.focus = 100;
+    const double spec = worstJump (run (in, s, sr, 0, &key));
+    std::printf ("  worst sample-to-sample step: plain gate %.4f, spectral (Focus 100) %.4f\n", plain, spec);
+    CHECK (spec <= plain * 1.1 + 1e-4, "spectral step %.4f vs plain %.4f", spec, plain);
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);
@@ -878,6 +1041,11 @@ int main()
     testGlowAliasing();
     testGlowEnvelope();
     testGlowSwitchingClickFree();
+    testSpectralNeutral();
+    testSpectralLearnsPartials();
+    testSpectralCleansTail();
+    testSpectralSustain();
+    testSpectralRestRampClean();
     std::printf ("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILED", gFailures);
     return gFailures == 0 ? 0 : 1;
 }

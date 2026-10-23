@@ -73,7 +73,7 @@ if(TG_BUILD_TESTS)
     enable_testing()
     # Engine tests: plain C++, no JUCE.
     add_executable(GateTests tests/test_engine.cpp)
-    target_include_directories(GateTests PRIVATE Source)
+    target_include_directories(GateTests PRIVATE Source tests)
     add_test(NAME engine COMMAND GateTests)
 
     # Plug-in level tests: the real processor, driven like a host drives it.
@@ -96,7 +96,7 @@ option(TG_BUILD_TOOLS "Build the UI snapshot tool" OFF)
 if(TG_BUILD_TOOLS)
     juce_add_console_app(GateSnapshot PRODUCT_NAME "GateSnapshot")
     target_sources(GateSnapshot PRIVATE tools/Snapshot.cpp Source/PluginProcessor.cpp Source/PluginEditor.cpp)
-    target_include_directories(GateSnapshot PRIVATE Source)
+    target_include_directories(GateSnapshot PRIVATE Source tests)
     target_compile_definitions(GateSnapshot PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
         JucePlugin_Name="The Gate" JucePlugin_VersionString="${TG_VERSION}")

@@ -27,6 +27,11 @@ namespace tg::pid
     inline constexpr const char* glowType    = "glowType";
     inline constexpr const char* glowDrive   = "glowDrive";
     inline constexpr const char* glowEnv     = "glowEnv";
+
+    // Phase 3
+    inline constexpr const char* specOn      = "specOn";
+    inline constexpr const char* specFocus   = "specFocus";
+    inline constexpr const char* specSustain = "specSustain";
 }
 
 namespace tg
