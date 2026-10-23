@@ -7,10 +7,11 @@ import os
 import numpy as np
 from scipy.io import wavfile
 
-CLOSE_MICS = ["kick_in", "kick_port", "snare_top", "snare_top_ldc", "snare_bot", "rack1", "rack2", "floor1", "floor2", "hat", "ride"]
-AMBIENT = ["oh_l", "oh_r", "room_l", "room_r"]
+CLOSE_MICS = ["kick_in", "kick_port", "kick_out", "snare_top", "snare_top_ldc", "snare_bot", "rack1", "rack2", "floor1", "floor2", "hat", "ride"]
+AMBIENT = ["oh_l", "oh_r", "oh_mono", "room_l", "room_r", "room", "room_front", "kit_center"]
+INSTRUMENTS = ["bass_di", "bass_amp", "vocal", "bgv_c", "bgv_j", "gtr1_414", "gtr1_di", "gtr1_rbn", "gtr2_414", "gtr2_di", "gtr2_rbn"]   # isolated, no bleed into the drums
 NOT_A_MIC = ["kick_trig"]          # replaced kick sample: timing reference only
-DRUM_OF = {"kick_in": "kick", "kick_port": "kick", "snare_top": "snare", "snare_top_ldc": "snare", "snare_bot": "snare",
+DRUM_OF = {"kick_in": "kick", "kick_port": "kick", "kick_out": "kick", "snare_top": "snare", "snare_top_ldc": "snare", "snare_bot": "snare",
            "rack1": "rack1", "rack2": "rack2", "floor1": "floor1", "floor2": "floor2", "hat": "hat", "ride": "ride"}
 
 

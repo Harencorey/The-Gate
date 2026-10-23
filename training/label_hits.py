@@ -1,35 +1,36 @@
-"""Auto-labels every drum hit in a multitrack session, from arrival time and level.
+"""Confident hit labels for a multitrack drum session.
 
-The struck drum reaches its own close mic first. Every other mic hears it later by a fixed delay
-(the kit's geometry) and quieter by a roughly fixed amount: the BLEED MAP.
-  1. Events: onsets on any close mic or overhead, grouped within 6 ms.
-  2. Per event and mic: the NEW level (peak minus what was already ringing) and a precise arrival time.
-  3. Seeds: events where one mic leads every other mic by >= 0.4 ms (one source struck alone).
-     They give the bleed map: delay and level of each source in each mic.
-  4. Labelling: mics in arrival order. A mic is bleed when the sources already claimed at this
-     event explain it (arrival within tolerance of the learned delay and level <= expected + 9 dB);
-     otherwise its own drum was struck. The overheads stand for cymbals with no close mic (crashes).
+Every hit is SURE or UNSURE; anything else at an event is bleed. Training and the gate tests use the
+SURE set; UNSURE hits are kept for review (and later the ARA review timeline).
 
-Usage: python3 label_hits.py <session_root> <out_dir>
+  kick, snare  the own mic's new level at each event falls into a bleed group and one or more hit
+               groups (soft / full). A Gaussian mixture on the level (dB) finds them; the lowest group
+               is bleed. Snare uses the bottom mic, which barely hears the hats. A kick trigger, when
+               the session has one, is a second witness: SURE needs the mic and the trigger to agree.
+  toms         RATIOS, not levels: bleed into a tom mic sits at a fixed ratio to the source's own mic
+               (kit geometry), however hard that source is hit. A tom is hit when its mic is >= 12 dB
+               (SURE) or >= 6 dB (UNSURE) over the loudest bleed expected from everything else heard at
+               that instant: kick and snare when struck, the overheads (cymbals) and the hat mic always,
+               and other toms that were hit.
+  cymbals      not labelled yet (no reliable separation in these sessions; not a v1 gate target).
+
+Usage: python3 label_hits.py <session_dir> <out_dir>      (session_dir holds song folders)
 """
 import json, os, sys, warnings
 import numpy as np
+from sklearn.mixture import GaussianMixture
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gatedata as gd
 import arrivals as ar
 warnings.filterwarnings("ignore")
 
-SOURCES = [("kick", "kick_in"), ("snare", "snare_top"), ("rack1", "rack1"), ("rack2", "rack2"), ("floor1", "floor1"),
-           ("floor2", "floor2"), ("hat", "hat"), ("ride", "ride"), ("cymbal", "oh_l"), ("cymbal", "oh_r")]
-DRUMS = ["kick", "snare", "rack1", "rack2", "floor1", "floor2", "hat", "ride", "cymbal"]
-LEAD = 0.4e-3      # seed: lead over every other mic
-TOL = 0.8e-3       # arrival tolerance around the learned delay
-OVER = 10 ** (9 / 20)
-MIN_DB = -40.0     # quietest hit labelled, re a full hit
+KICK, SNARE = ["kick_in", "kick_port", "kick_out"], ["snare_bot", "snare_top"]
+TOMS = ["rack1", "rack2", "floor1", "floor2"]
+SURE_DB, UNSURE_DB = 12.0, 6.0
 
 
-def events_for(song, sr):
-    allt = np.sort(np.concatenate([gd.onsets(song[m], sr)[0] for _, m in SOURCES]))
+def events_for(song, sr, mics):
+    allt = np.sort(np.concatenate([gd.onsets(song[m], sr)[0] for m in mics]))
     ev, cur = [], [allt[0]]
     for t in allt[1:]:
         if t - cur[0] <= int(0.006 * sr): cur.append(t)
@@ -38,98 +39,141 @@ def events_for(song, sr):
     return np.array(ev, dtype=np.int64)
 
 
-def bleed_map(L, T, sr):
-    n = L.shape[1]
-    Ts = np.where(np.isnan(T), np.inf, T)
-    o = np.argsort(Ts, 1)
-    r = np.arange(len(T))
-    lead = (Ts[r, o[:, 1]] - Ts[r, o[:, 0]]) / sr
-    have2 = np.isfinite(Ts[r, o[:, 1]])
-    # the leader must be a real hit in its own mic (>= -20 dB of its loud hits)
-    big = np.array([np.percentile(L[L[:, s] > 0, s], 98) for s in range(n)])
-    lead_lvl = L[r, o[:, 0]] / big[o[:, 0]]
-    seed = have2 & (lead >= LEAD) & (lead_lvl >= 0.1)
-    D = np.zeros((n, n)); R = np.eye(n); nseed = np.zeros(n, int)
-    for s in range(n):
-        e = seed & (o[:, 0] == s)
-        nseed[s] = e.sum()
-        for m in range(n):
-            if m == s: continue
-            ok = e & ~np.isnan(T[:, m])
-            if ok.sum() >= 8:
-                D[s, m] = np.median(T[ok, m] - T[ok, s]) / sr
-                R[s, m] = np.median(L[ok, m] / L[ok, s])
-            else:   # unknown pair: far apart, quiet
-                D[s, m], R[s, m] = 4e-3, 10 ** (-30 / 20)
-    ref = np.array([np.percentile(L[seed & (o[:, 0] == s), s], 90) if nseed[s] >= 8 else np.percentile(L[L[:, s] > 0, s], 98)
-                    for s in range(n)])
-    return D, R, ref, nseed
+def hit_probability(level_db):
+    """P(hit) per event from a 2-4 group Gaussian mixture on the level; the lowest group is bleed."""
+    x = level_db[level_db > -90].reshape(-1, 1)
+    best = None
+    for k in (2, 3, 4):
+        g = GaussianMixture(k, n_init=3, random_state=0).fit(x)
+        b = g.bic(x)
+        if best is None or b < best[0]: best = (b, g)
+    g = best[1]
+    mu, sd = g.means_[:, 0], np.sqrt(g.covariances_.reshape(-1))
+    o = np.argsort(mu)
+    # bleed groups / hit groups: split at the widest gap between neighbouring groups, in spreads
+    sep = [(mu[o[k + 1]] - mu[o[k]]) / (sd[o[k + 1]] + sd[o[k]]) for k in range(len(o) - 1)]
+    cut = int(np.argmax(sep))
+    bleed = o[: cut + 1]
+    post = g.predict_proba(np.maximum(level_db, -90).reshape(-1, 1))
+    p = 1 - post[:, bleed].sum(axis=1)
+    p[level_db < mu[o[cut]]] = 0.0                              # never a hit below the top bleed group's centre
+    groups = sorted((round(float(m), 1), round(float(np.sqrt(c.ravel()[0])), 1), round(float(w), 3))
+                    for m, c, w in zip(g.means_[:, 0], g.covariances_, g.weights_))
+    return p, {"groups_mean_sd_weight": groups, "hit_groups_from_dbfs": round(float(mu[o[cut + 1]]), 1)}
 
 
-def label_events(L, T, ev, sr, D, R, ref):
-    n = L.shape[1]
-    hits = []
-    for e in range(len(ev)):
-        order = [m for m in np.argsort(np.where(np.isnan(T[e]), np.inf, T[e])) if not np.isnan(T[e, m])]
-        own = []
-        for m in order:
-            exp = sum(R[s, m] * L[e, s] for s in own)
-            timed = any(abs((T[e, m] - T[e, s]) / sr - D[s, m]) <= TOL for s in own)
-            if own and timed and L[e, m] <= OVER * exp:
-                continue                                   # bleed from what was struck
-            lvl = L[e, m] / ref[m]
-            if gd.db(lvl) < MIN_DB: continue
-            own.append(m)
-            # confidence: how far above the bleed it would have been (no claimed source -> 1)
-            conf = 1.0 if exp <= 0 else float(min(1.0, 1 - exp / L[e, m]))
-            hits.append({"drum": SOURCES[m][0], "mic": SOURCES[m][1], "sample": int(round(T[e, m])),
-                         "time": round(float(T[e, m]) / sr, 6), "level_db": round(float(gd.db(lvl)), 2),
-                         "confidence": round(max(conf, 0.0), 3)})
-    hits.sort(key=lambda h: (h["sample"], h["drum"]))
-    out, last = [], {}
-    for h in hits:   # one label per source per 20 ms (both overheads hearing one crash = one hit)
-        if h["sample"] - last.get(h["drum"], -10 ** 9) >= int(0.020 * sr):
-            out.append(h); last[h["drum"]] = h["sample"]
-    return out
-
-
-def label_song(path):
+def label_song(path, cache=None):
     song, sr = gd.load_song(path)
-    ev = events_for(song, sr)
-    xs = [ar.hp(song[m], sr) for _, m in SOURCES]
-    L, T = ar.measure(xs, ev, sr)
-    D, R, ref, nseed = bleed_map(L, T, sr)
-    hits = label_events(L, T, ev, sr, D, R, ref)
-    names = [m for _, m in SOURCES]
-    return {"sr": sr, "length": len(song["kick_in"]), "hits": hits,
-            "seeds": {names[i]: int(nseed[i]) for i in range(len(names))},
-            "bleed_delay_ms": {names[i]: {names[j]: round(D[i, j] * 1000, 2) for j in range(len(names))} for i in range(len(names))},
-            "bleed_level_db": {names[i]: {names[j]: round(float(gd.db(R[i, j])), 1) for j in range(len(names))} for i in range(len(names))},
-            "ref_dbfs": {names[i]: round(float(gd.db(ref[i])), 1) for i in range(len(names))}}, song, sr
+    have = set(song)
+    kick_mic = next(m for m in KICK if m in have)
+    snare_mic = next(m for m in SNARE if m in have)
+    snare_top = "snare_top" if "snare_top" in have else snare_mic
+    toms = [t for t in TOMS if t in have]
+    refs = [m for m in ("hat", "oh_l", "oh_r") if m in have]   # always-on bleed references (cymbals)
+    mics = list(dict.fromkeys([kick_mic, snare_top, snare_mic] + toms + refs))
+    if cache and os.path.exists(cache):
+        z = np.load(cache, allow_pickle=True)
+        if list(z["mics"]) == mics: ev, L, T = z["ev"], z["L"], z["T"]
+        else: cache = None
+    if not (cache and os.path.exists(cache)):
+        ev = events_for(song, sr, mics)
+        L, T = ar.measure([ar.hp(song[m], sr) for m in mics], ev, sr)
+    I = {m: k for k, m in enumerate(mics)}
+    lv = {m: gd.db(np.maximum(L[:, I[m]], 1e-9)) for m in mics}
+    hits, info = [], {}
+
+    def add(drum, mic, e, sure, why, extra=None):
+        t = T[e, I[mic]] if not np.isnan(T[e, I[mic]]) else ev[e]
+        h = {"drum": drum, "mic": mic, "sample": int(round(t)), "time": round(float(t) / sr, 6),
+             "level_dbfs": round(float(lv[mic][e]), 2), "sure": bool(sure), "why": why}
+        if extra: h.update(extra)
+        hits.append(h)
+
+    # --- kick and snare: mixture on the own mic's level
+    pk, info["kick"] = hit_probability(lv[kick_mic]); info["kick"]["mic"] = kick_mic
+    ps, info["snare"] = hit_probability(lv[snare_mic]); info["snare"]["mic"] = snare_mic
+    kick_hit, snare_hit = pk >= 0.5, ps >= 0.5
+    kick_sure = pk >= 0.9
+    if "kick_trig" in have:
+        # the trigger is a witness: its sample has a second attack ~45 ms in, it misses some kicks
+        # and false-fires on loud toms. SURE = mic and trigger agree.
+        t, _ = gd.onsets(song["kick_trig"], sr)
+        tp = gd.db(gd.peak_after(song["kick_trig"], t, sr))
+        tr = t[tp >= tp.max() - 12]
+        loud = ev[kick_sure] if kick_sure.sum() >= 20 else ev[kick_hit]
+        off = np.array([s - loud[np.argmin(np.abs(loud - s))] for s in tr])
+        lat = int(np.median(off[(off > 0) & (off < int(0.025 * sr))]))
+        trig = np.array([np.any(np.abs(tr - lat - e) <= int(0.005 * sr)) for e in ev])
+        info["kick"].update({"trigger_latency_ms": round(lat / sr * 1000, 2),
+                             "trigger_fired_without_kick": int(np.sum(trig & ~kick_hit))})
+        kick_sure = kick_sure & trig
+        kwhy = ("kick mic + trigger", "kick mic only (no trigger, or not clearly above bleed)")
+    else:
+        kwhy = ("kick mic", "kick mic, not clearly above bleed")
+    for e in np.nonzero(kick_hit)[0]: add("kick", kick_mic, e, kick_sure[e], kwhy[0] if kick_sure[e] else kwhy[1], {"p": round(float(pk[e]), 3)})
+    for e in np.nonzero(snare_hit)[0]:
+        add("snare", snare_top, e, ps[e] >= 0.9, "snare bottom mic" if ps[e] >= 0.9 else "snare bottom, near bleed (ghost?)", {"p": round(float(ps[e]), 3)})
+
+    # --- toms: excess over the loudest expected bleed, from ratios
+    struck = {kick_mic: kick_hit, snare_top: snare_hit}
+    B = {}
+    for tom in toms:
+        for s, hit in struck.items():
+            only = hit & ~np.any([h for k2, h in struck.items() if k2 != s], axis=0) & (L[:, I[s]] > 0) & (L[:, I[tom]] > 0)
+            B[(s, tom)] = float(np.median(lv[tom][only] - lv[s][only])) if only.sum() >= 20 else -30.0
+        quiet = ~kick_hit & ~snare_hit
+        for r in refs:
+            ok = quiet & (L[:, I[r]] > 0) & (L[:, I[tom]] > 0)
+            B[(r, tom)] = float(np.median(lv[tom][ok] - lv[r][ok])) if ok.sum() >= 20 else -30.0
+
+    def excess(tom, extra_refs=()):
+        exp = np.full(len(ev), -200.0)
+        for s, hit in struck.items():
+            exp = np.where(hit, np.maximum(exp, lv[s] + B[(s, tom)]), exp)
+        for r in refs: exp = np.maximum(exp, np.where(L[:, I[r]] > 0, lv[r] + B[(r, tom)], -200.0))
+        for (src, mask) in extra_refs: exp = np.where(mask, np.maximum(exp, lv[src] + B[(src, tom)]), exp)
+        return np.where(L[:, I[tom]] > 0, lv[tom] - exp, -200.0)
+
+    ex = {t: excess(t) for t in toms}
+    # pass 2: tom-to-tom bleed, learned from pass-1 SURE hits, then each tom judged against the others
+    sure1 = {t: ex[t] >= SURE_DB for t in toms}
+    for a in toms:
+        for b in toms:
+            if a == b: continue
+            ok = sure1[a] & ~sure1[b] & (L[:, I[b]] > 0)
+            B[(a, b)] = float(np.median(lv[b][ok] - lv[a][ok])) if ok.sum() >= 5 else -6.0
+    ex = {t: excess(t, [(o, ex[o] >= UNSURE_DB) for o in toms if o != t]) for t in toms}
+    for t in toms:
+        for e in np.nonzero(ex[t] >= UNSURE_DB)[0]:
+            add(t, t, e, ex[t][e] >= SURE_DB, f"{ex[t][e]:.0f} dB over expected bleed", {"excess_db": round(float(ex[t][e]), 1)})
+        info[t] = {"bleed_ratio_db": {s: round(B[(s, t)], 1) for s in list(struck) + refs + [o for o in toms if o != t]}}
+
+    # one label per drum per 20 ms; SURE beats UNSURE at the same hit
+    hits.sort(key=lambda h: (h["drum"], h["sample"]))
+    out = []
+    for h in hits:
+        if out and out[-1]["drum"] == h["drum"] and h["sample"] - out[-1]["sample"] < int(0.020 * sr):
+            if h["sure"] and not out[-1]["sure"]: out[-1] = h
+            continue
+        out.append(h)
+    out.sort(key=lambda h: (h["sample"], h["drum"]))
+    return {"sr": sr, "length": len(song[kick_mic]), "hits": out, "how": info}, song, sr
 
 
-def kick_check(result, song, sr):
-    """Kick labels vs the kick trigger, an independent reference: each loud trigger should have a kick
-    label 6-16 ms before it (the trigger's latency is ~11.7 ms), and vice versa."""
-    t, _ = gd.onsets(song["kick_trig"], sr)
-    pk = gd.db(gd.peak_after(song["kick_trig"], t, sr))
-    trig = t[pk >= -25]
-    keep = [True] + [trig[i] - trig[i - 1] >= int(0.050 * sr) for i in range(1, len(trig))]
-    trig = trig[np.array(keep)]
-    kicks = np.array([h["sample"] for h in result["hits"] if h["drum"] == "kick"])
-    lo, hi = int(0.006 * sr), int(0.016 * sr)
-    matched = sum(1 for s in trig if np.any((kicks >= s - hi) & (kicks <= s - lo)))
-    extra = [k for k in kicks if not np.any((trig >= k + lo) & (trig <= k + hi))]
-    return {"loud_triggers": len(trig), "matched": matched, "kick_labels": len(kicks), "kick_labels_without_trigger": len(extra)}
+def summary(res):
+    c = {}
+    for h in res["hits"]:
+        s = c.setdefault(h["drum"], [0, 0]); s[0 if h["sure"] else 1] += 1
+    return {d: f"{v[0]} sure / {v[1]} unsure" for d, v in c.items()}
 
 
 if __name__ == "__main__":
     root, out = sys.argv[1], sys.argv[2]
     os.makedirs(out, exist_ok=True)
-    for session, name, path in gd.songs(root):
-        res, song, sr = label_song(path)
-        res["kick_vs_trigger"] = kick_check(res, song, sr)
-        with open(os.path.join(out, f"{session}_{name}.json"), "w") as f:
-            json.dump(res, f)
-        counts = {d: sum(1 for h in res["hits"] if h["drum"] == d) for d in DRUMS}
-        print(f"{session}/{name}: {len(res['hits'])} hits {counts}  kick vs trigger {res['kick_vs_trigger']}", flush=True)
+    sess = os.path.basename(os.path.normpath(root))
+    for song_name in sorted(os.listdir(root)):
+        p = os.path.join(root, song_name)
+        if not os.path.isdir(p): continue
+        res, _, _ = label_song(p)
+        with open(os.path.join(out, f"{sess}_{song_name}.json"), "w") as f: json.dump(res, f, indent=0)
+        print(f"{sess}/{song_name}: {summary(res)}", flush=True)
