@@ -75,6 +75,9 @@ if(TG_BUILD_TESTS)
     add_executable(GateTests tests/test_engine.cpp)
     target_include_directories(GateTests PRIVATE Source tests)
     add_test(NAME engine COMMAND GateTests)
+    # Offline runner for real tracks (training/eval_engine.py drives it).
+    add_executable(RealRun tools/RealRun.cpp)
+    target_include_directories(RealRun PRIVATE Source)
 
     # Plug-in level tests: the real processor, driven like a host drives it.
     juce_add_console_app(GateProcessorTests PRODUCT_NAME "GateProcessorTests")
