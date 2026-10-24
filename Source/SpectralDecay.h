@@ -152,6 +152,8 @@ public:
     void reset()
     {
         for (auto& ch : bp) for (auto& f : ch) f.reset();
+        for (auto& f : lp) f.reset();
+        bodyHz = pendingBodyHz = 0.0;
         for (int k = 0; k < kMaxPartials; ++k) { env[k] = peak[k] = 0.0; floorLog[k] = -200.0; own[k] = 0.0; holding[k] = false; }
         numPartials = 0;
         pendingCount = -1;
@@ -189,6 +191,10 @@ public:
         channels = std::min (channels, numCh);
         float in[kMaxCh];
         for (int c = 0; c < channels; ++c) in[c] = x[c];
+
+        //---------------- the body band (always running): everything below the body crossover
+        double lpOut[kMaxCh];
+        for (int c = 0; c < channels; ++c) { double hpUnused; lpOut[c] = bodyHz > 0.0 ? lp[c].tick (x[c], hpUnused) : 0.0; }
 
         //---------------- partial band-passes (always running) and their envelopes
         double bpOut[kMaxPartials][kMaxCh];
@@ -275,9 +281,15 @@ public:
         {
             const float plain = x[c] * g;   // exactly the gate's own output
             if (mix <= 0.0) { x[c] = plain; continue; }
+            // the rest closes at gRest; the source's body band follows the gate exactly like the plain
+            // gate (so the drum keeps its weight); partials ring relative to whichever band they sit in
             float y = x[c] * gRest;
+            if (bodyHz > 0.0) y += (g - gRest) * (float) lpOut[c];
             for (int k = 0; k < numPartials; ++k)
-                y += (gk[k] - gRest) * weight[k] * (float) bpOut[k][c];   // exactly 0 when the gains are equal
+            {
+                const float base = inBody[k] ? g : gRest;
+                y += (gk[k] - base) * weight[k] * (float) bpOut[k][c];   // exactly 0 when the gains are equal
+            }
             x[c] = mix >= 1.0 ? y : plain + (float) mix * (y - plain);
         }
 
@@ -293,6 +305,7 @@ public:
     int hitsLearned() const noexcept { return hits; }
     int bleedsLearned() const noexcept { return bleeds; }
     float restGain() const noexcept { return gRest; }
+    float bodyTopHz() const noexcept { return (float) bodyHz; }   // 0 = no body band (a high source)
     // the learned source / bleed spectrum at a frequency (dB, for tests and analysis)
     double sourceDbAt (double hz) const noexcept { const size_t i = (size_t) std::lround (hz * fftSize / sr); return 10.0 * std::log10 (std::max (srcPow[std::min (i, srcPow.size() - 1)], 1e-30)); }
     double bleedDbAt (double hz) const noexcept { const size_t i = (size_t) std::lround (hz * fftSize / sr); return 10.0 * std::log10 (std::max (bleedPow[std::min (i, bleedPow.size() - 1)], 1e-30)); }
@@ -363,7 +376,26 @@ private:
         auto dbAt = [&] (const std::vector<double>& v, int i) { return 10.0 * std::log10 (std::max (v[(size_t) i], 1e-30)); };
         const int lo = std::max (3, (int) std::ceil (40.0 / binHz)), hi = std::min (nyq - 3, (int) (12000.0 / binHz));
         double maxDb = -400.0;
-        for (int i = lo; i <= hi; ++i) maxDb = std::max (maxDb, dbAt (srcPow, i));
+        int maxBin = lo;
+        for (int i = lo; i <= hi; ++i) if (dbAt (srcPow, i) > maxDb) { maxDb = dbAt (srcPow, i); maxBin = i; }
+
+        // the body band: a low source (peak below 400 Hz) keeps everything from the bottom up to where
+        // its spectrum (max over a sixth of an octave) has fallen 30 dB under the peak, at most 800 Hz.
+        // Real drums aren't a few clean partials: the shell's broad low-mid resonance is the drum's
+        // weight, and closing it with the wash made toms thin.
+        pendingBodyHz = 0.0;
+        if (maxBin * binHz < 400.0)
+        {
+            const double sixth = std::pow (2.0, 1.0 / 6.0);
+            int last = maxBin;
+            for (int i = maxBin; i <= std::min (hi, (int) (800.0 / binHz)); ++i)
+            {
+                double m = -400.0;
+                for (int j = std::max (lo, (int) (i / sixth)); j <= std::min (hi, (int) std::ceil (i * sixth)); ++j) m = std::max (m, dbAt (srcPow, j));
+                if (m >= maxDb - 30.0) last = i; else break;
+            }
+            pendingBodyHz = last * binHz;
+        }
 
         struct Cand { int bin; double db; };
         Cand cand[64]; int nc = 0;
@@ -423,6 +455,11 @@ private:
         }
         numPartials = pendingCount;
         pendingCount = -1;
+        const double xo = std::min (1000.0, pendingBodyHz * 1.25);   // crossover a little above the body's top
+        if (pendingBodyHz > 0.0 && std::abs (std::log2 (xo / std::max (1.0, bodyHz * 1.25))) > 0.1)
+            for (int c = 0; c < numCh; ++c) { lp[c].setup (xo, sr, 0.70710678); if (bodyHz <= 0.0) lp[c].reset(); }
+        bodyHz = pendingBodyHz;
+        for (int k = 0; k < numPartials; ++k) inBody[k] = bodyHz > 0.0 && partials[k].hz < bodyHz * 1.25;
         solveWeights();
     }
 
@@ -501,6 +538,9 @@ private:
 
     // partials
     Svf bp[kMaxCh][kMaxPartials];
+    Svf lp[kMaxCh];                       // the body band
+    double bodyHz = 0.0, pendingBodyHz = 0.0;
+    bool inBody[kMaxPartials] {};
     PartialInfo partials[kMaxPartials], pending[kMaxPartials];
     int numPartials = 0, pendingCount = -1;
     float weight[kMaxPartials] { 1, 1, 1, 1, 1, 1, 1, 1 };
