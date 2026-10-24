@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore")
 KICK, SNARE = ["kick_in", "kick_port", "kick_out"], ["snare_bot", "snare_top"]
 TOMS = ["rack1", "rack2", "floor1", "floor2"]
 SURE_DB, UNSURE_DB = 12.0, 6.0
-TOM_FLOOR_SURE, TOM_FLOOR_UNSURE = 24.0, 30.0   # dB below the tom's loudest hits (99.5th pct)
+TOM_FLOOR_SURE, TOM_FLOOR_UNSURE = 18.0, 30.0   # dB below the tom's loudest hits (99.5th pct)
 STICK_HZ = 1500.0
 
 
