@@ -27,6 +27,8 @@ warnings.filterwarnings("ignore")
 KICK, SNARE = ["kick_in", "kick_port", "kick_out"], ["snare_bot", "snare_top"]
 TOMS = ["rack1", "rack2", "floor1", "floor2"]
 SURE_DB, UNSURE_DB = 12.0, 6.0
+TOM_FLOOR_SURE, TOM_FLOOR_UNSURE = 24.0, 30.0   # dB below the tom's loudest hits (99.5th pct)
+STICK_HZ = 1500.0
 
 
 def events_for(song, sr, mics):
@@ -80,6 +82,12 @@ def label_song(path, cache=None):
         L, T = ar.measure([ar.hp(song[m], sr) for m in mics], ev, sr)
     I = {m: k for k, m in enumerate(mics)}
     lv = {m: gd.db(np.maximum(L[:, I[m]], 1e-9)) for m in mics}
+    # toms are judged in the stick band: sympathetic ring (a floor tom ringing off the kick) lives at
+    # the tom's pitch and has no stick attack; a real hit cracks well above 1.5 kHz in its own mic
+    hb = [m for m in mics if m in toms or m in refs or m in (kick_mic, snare_top)]
+    LH, _ = ar.measure([ar.hp(song[m], sr, STICK_HZ) for m in hb], ev, sr)
+    lvh = {m: gd.db(np.maximum(LH[:, k], 1e-9)) for k, m in enumerate(hb)}
+    hasH = {m: LH[:, k] > 0 for k, m in enumerate(hb)}
     hits, info = [], {}
 
     def add(drum, mic, e, sure, why, extra=None):
@@ -119,20 +127,20 @@ def label_song(path, cache=None):
     B = {}
     for tom in toms:
         for s, hit in struck.items():
-            only = hit & ~np.any([h for k2, h in struck.items() if k2 != s], axis=0) & (L[:, I[s]] > 0) & (L[:, I[tom]] > 0)
-            B[(s, tom)] = float(np.median(lv[tom][only] - lv[s][only])) if only.sum() >= 20 else -30.0
+            only = hit & ~np.any([h for k2, h in struck.items() if k2 != s], axis=0) & hasH[s] & hasH[tom]
+            B[(s, tom)] = float(np.median(lvh[tom][only] - lvh[s][only])) if only.sum() >= 20 else -30.0
         quiet = ~kick_hit & ~snare_hit
         for r in refs:
-            ok = quiet & (L[:, I[r]] > 0) & (L[:, I[tom]] > 0)
-            B[(r, tom)] = float(np.median(lv[tom][ok] - lv[r][ok])) if ok.sum() >= 20 else -30.0
+            ok = quiet & hasH[r] & hasH[tom]
+            B[(r, tom)] = float(np.median(lvh[tom][ok] - lvh[r][ok])) if ok.sum() >= 20 else -30.0
 
     def excess(tom, extra_refs=()):
         exp = np.full(len(ev), -200.0)
         for s, hit in struck.items():
-            exp = np.where(hit, np.maximum(exp, lv[s] + B[(s, tom)]), exp)
-        for r in refs: exp = np.maximum(exp, np.where(L[:, I[r]] > 0, lv[r] + B[(r, tom)], -200.0))
-        for (src, mask) in extra_refs: exp = np.where(mask, np.maximum(exp, lv[src] + B[(src, tom)]), exp)
-        return np.where(L[:, I[tom]] > 0, lv[tom] - exp, -200.0)
+            exp = np.where(hit, np.maximum(exp, lvh[s] + B[(s, tom)]), exp)
+        for r in refs: exp = np.maximum(exp, np.where(hasH[r], lvh[r] + B[(r, tom)], -200.0))
+        for (src, mask) in extra_refs: exp = np.where(mask, np.maximum(exp, lvh[src] + B[(src, tom)]), exp)
+        return np.where(hasH[tom], lvh[tom] - exp, -200.0)
 
     ex = {t: excess(t) for t in toms}
     # pass 2: tom-to-tom bleed, learned from pass-1 SURE hits, then each tom judged against the others
@@ -140,12 +148,17 @@ def label_song(path, cache=None):
     for a in toms:
         for b in toms:
             if a == b: continue
-            ok = sure1[a] & ~sure1[b] & (L[:, I[b]] > 0)
-            B[(a, b)] = float(np.median(lv[b][ok] - lv[a][ok])) if ok.sum() >= 5 else -6.0
+            ok = sure1[a] & ~sure1[b] & hasH[b]
+            B[(a, b)] = float(np.median(lvh[b][ok] - lvh[a][ok])) if ok.sum() >= 5 else -6.0
     ex = {t: excess(t, [(o, ex[o] >= UNSURE_DB) for o in toms if o != t]) for t in toms}
+    # several toms over the bar at the same instant: only the one furthest over stays SURE
+    exm = np.stack([ex[t] for t in toms], 1)
+    lead_tom = np.argmax(exm, 1)
     for t in toms:
-        for e in np.nonzero(ex[t] >= UNSURE_DB)[0]:
-            add(t, t, e, ex[t][e] >= SURE_DB, f"{ex[t][e]:.0f} dB over expected bleed", {"excess_db": round(float(ex[t][e]), 1)})
+        top = np.percentile(lv[t][L[:, I[t]] > 0], 99.5)
+        for e in np.nonzero((ex[t] >= UNSURE_DB) & (lv[t] >= top - TOM_FLOOR_UNSURE))[0]:
+            sure = ex[t][e] >= SURE_DB and lv[t][e] >= top - TOM_FLOOR_SURE and toms[lead_tom[e]] == t
+            add(t, t, e, sure, f"{ex[t][e]:.0f} dB over expected bleed, {lv[t][e] - top:.0f} dB re loudest", {"excess_db": round(float(ex[t][e]), 1)})
         info[t] = {"bleed_ratio_db": {s: round(B[(s, t)], 1) for s in list(struck) + refs + [o for o in toms if o != t]}}
 
     # one label per drum per 20 ms; SURE beats UNSURE at the same hit
