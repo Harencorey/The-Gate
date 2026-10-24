@@ -37,7 +37,10 @@ It ships in stages so every release is something usable in a real session.
   - Bleed floors use minimum tracking, so a source tail heard while the gate is shut isn't learned as bleed.
   - Attack cleanup (pulling a crash out of the first 5 ms) moves to Phase 5, where it can use the trained source profile.
 - Branches: one per phase (`phase-1` snapshot, `phase-2`, `phase-3`); each branch push gets a Mac test build (`test-<branch>` pre-release); `main` gets the official releases.
-- **Next: Phase 4**, training data and factory models (pitch tracking of partials comes with it).
+- **Phase 4: started** on branch `phase-4` (Oct 23). Training data: Corey's session 1 (7 songs, one kit, 16 mics) and a Rock session (different kit; isolated guitar/bass/vocal overdubs, no instrument bleed in the drum mics). Hit labels are SURE/UNSURE (`training/label_hits.py`); MIDI exports for review by ear.
+  - Labelling lessons: the kick trigger is a witness, not ground truth (built-in re-attack ~45 ms in, misses kicks, false-fires on toms); the hat mic hears the snare as loud as the snare mic; floor toms ring sympathetically off the kick (Corey confirmed, Song 1 intro); toms are judged in the stick band (>1.5 kHz) against bleed ratios from mic to mic.
+  - **Baseline measured on the real tracks** (exact engine, one threshold per drum for the whole session, `training/eval_pooled.py`): snare 98% of hits pass with 0.8% leak. Toms at <= 2% leak pass only 47-79% of hits (rack 1 47%, rack 2 68%, floor 1 67%, floor 2 79%); passing 90%+ costs 8-17% leak, because snare bleed in the tom mics sits where the softer tom hits are. Floor toms ringing off the kick never open the gate. Spectral decay (Focus 60) cuts tail wash 2-6 dB on toms, 5.6 dB on snare, but costs 1.5-2 dB of tom body (more than in simulation; to check by ear).
+  - **Phase 4 target:** toms >= 95% passed at <= 2% leak on these sessions (held-out songs).
 
 ## Phases
 
