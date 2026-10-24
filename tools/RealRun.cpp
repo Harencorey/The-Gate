@@ -78,5 +78,16 @@ int main (int argc, char** argv)
     std::fwrite (y.data() + L, sizeof (float), (size_t) n, of);
     std::fclose (of);
     std::fprintf (stderr, "latency %d samples, %ld samples processed\n", L, n);
+    auto& sd = eng->spectralDecay();
+    std::fprintf (stderr, "spectral: %d hits learned, %d bleed captures, %d partials:", sd.hitsLearned(), sd.bleedsLearned(), sd.numLearnedPartials());
+    for (int k = 0; k < sd.numLearnedPartials(); ++k) std::fprintf (stderr, " %.1f", sd.partialHz (k));
+    std::fprintf (stderr, "\n");
+    if (s.spectral.on)
+    {
+        std::fprintf (stderr, "spectrum (Hz: source dB / bleed dB):");
+        for (double hz : { 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 630.0, 1000.0, 2000.0, 4000.0, 8000.0 })
+            std::fprintf (stderr, " %.0f: %.0f/%.0f", hz, sd.sourceDbAt (hz), sd.bleedDbAt (hz));
+        std::fprintf (stderr, "\n");
+    }
     return 0;
 }
