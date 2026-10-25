@@ -22,7 +22,8 @@ private:
 };
 
 //==============================================================================
-// What the spectral decay has learned: the source's spectrum, the bleed's, the body band and the attack length.
+// What the spectral decay has learned (the source's spectrum, the bleed's, the body, the attack length)
+// and what it's cutting right now, band by band.
 class SpectrumView : public juce::Component, public juce::SettableTooltipClient
 {
 public:
@@ -105,7 +106,7 @@ private:
     GateDisplay display;
 
     Knob threshold, hysteresis, attack, hold, release, range, keyHpf, keyHighCut, tracking;
-    Knob levelAmount, levelTarget, levelMax, specTransient, specFocus, specSustain;
+    Knob levelAmount, levelTarget, levelMax, specTransient, specCut, specSens;
     ConcentricKnob glowDrive;
     SpectrumView spectrum;
     Choice lookahead, keySource, glowType;

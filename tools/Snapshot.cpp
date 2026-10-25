@@ -44,8 +44,8 @@ int main (int argc, char** argv)
     set (tg::pid::glowDrive, 35.0f);
     set (tg::pid::glowEnv, 60.0f);
     set (tg::pid::specOn, 1.0f);
-    set (tg::pid::specFocus, 70.0f);
-    set (tg::pid::specSustain, 40.0f);
+    set (tg::pid::specCut, 70.0f);
+    set (tg::pid::specSens, 6.0f);
     p.prepareToPlay (sr, 256);
 
     // the simulated tom mic (tests/DrumSim.h): toms with hats, snare and crashes bleeding in

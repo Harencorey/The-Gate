@@ -116,11 +116,8 @@ public:
         onsetRing.assign (ringSize, 0);
         keyAbsRing.assign (ringSize, 0.0f);
         glow.prepare (sr, numCh);
-        specHp1.setup (1000.0, sr, kButterQ1); specHp2.setup (1000.0, sr, kButterQ2);
-        specLp1.setup (500.0, sr, kButterQ1); specLp2.setup (500.0, sr, kButterQ2);
-        specRel = std::exp (-1.0 / (0.005 * sr)); specRise = 1.0 - std::exp (-1.0 / (0.030 * sr));
-        specHoldLen = (int) std::lround (0.002 * sr);
-        specLowHoldLen = (int) std::lround (0.025 * sr);
+        liftCoef = std::exp (-1.0 / (0.020 * sr)); liftFall = 20.0 / sr; liftRise = 1.0 - std::exp (-1.0 / (0.010 * sr));
+        liftHoldLen = (int) std::lround (0.025 * sr);
         spectral.prepare (sr, numCh);
         reset();
     }
@@ -133,7 +130,8 @@ public:
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
         std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
         spectral.reset();
-        specHp1.reset(); specHp2.reset(); specLp1.reset(); specLp2.reset(); specBp.reset(); specF0 = 0.0; specArmAt = specArmUntil = 0; specLowRef = 0.0; specEnv = specValley = specBB = specBBValley = 0.0; specHoldLeft = specBBHold = 0; lastSpecOnset = 0;
+        markHead = markCount = 0; lastAnnounced = UINT64_MAX;
+        liftLp1.reset(); liftLp2.reset(); liftPow = 0.0; liftHold = 0; liftRef = -200.0; lastLift = 0; liftHz = 0.0;
         writePos = 0;
         clock = 0;
         for (auto* f : { &hpf1, &hpf2, &lpf1, &lpf2 }) f->reset();
@@ -187,6 +185,19 @@ public:
         laTarget = lookaheadSamples (s.lookaheadMs);
         glow.setSettings (s.glow);
         spectral.setSettings (s.spectral, s.releaseMs, s.rangeDb);
+    }
+
+    // a hit's first sample on the output timeline: for the spectral decay (bit 1 = a stroke, 2 = a body lift)
+    void markOnset (uint64_t pos, uint8_t bit) noexcept
+    {
+        onsetRing[(size_t) (pos & (uint64_t) ringMask)] |= bit;
+        if (markCount == kMarkQ) return;
+        // keep the queue in order (marks can arrive a little out of order)
+        int i = markCount;
+        while (i > 0 && markQ[(markHead + i - 1) % kMarkQ] > pos) { markQ[(markHead + i) % kMarkQ] = markQ[(markHead + i - 1) % kMarkQ]; --i; }
+        if (i > 0 && markQ[(markHead + i - 1) % kMarkQ] == pos) { for (int j = i; j < markCount; ++j) markQ[(markHead + j) % kMarkQ] = markQ[(markHead + j + 1) % kMarkQ]; return; }
+        markQ[(markHead + i) % kMarkQ] = pos;
+        ++markCount;
     }
 
     int lookaheadSamples (float ms) const noexcept
@@ -243,54 +254,35 @@ public:
                 k /= std::max (1, numChannels);
             }
 
-            //---------------- stick-attack detector for the spectral decay (independent of the gate's
-            // stroke detection): a sharp jump in the key's high band (> 1 kHz) is a new stick hit, even a
-            // tom hit again while it's still ringing. The spectral decay re-opens its highs before it.
+            //---------------- body-lift detector for the spectral decay (never touches the gate): a new
+            // stroke lifts the drum's body (below the learned body top) even when the gate's stroke
+            // detection merges it (a fast fill, a drum hit while the gate is open on another). Seen on the
+            // undelayed key, so the spectral decay can stop cutting BEFORE the stroke arrives.
             {
-                double a1, hk;
-                specHp1.tick (k, a1); specHp2.tick (a1, hk);
-                const double ah = std::abs (hk);
-                if (ah >= specEnv) { specEnv = ah; specHoldLeft = specHoldLen; }
-                else if (specHoldLeft > 0) --specHoldLeft;
-                else specEnv = ah + (specEnv - ah) * specRel;
-                if (specEnv < specValley) specValley = specEnv;
-                else specValley += (specEnv - specValley) * specRise;
-                // the source's FUNDAMENTAL too (learned by the spectral decay; until then everything
-                // below 500 Hz): cymbals - even layered over a ringing drum - barely move it; a stick hit
-                // on the drum does
                 if ((clock % 4096) == 0)
                 {
-                    const double f0 = spectral.fundamentalHz();
-                    if (f0 > 0.0 && std::abs (f0 - specF0) > 0.5) { specF0 = f0; specBp.setup (f0, sr, 1.5); }
+                    const double top = spectral.bodyTopHz() > 0.0f ? (double) spectral.bodyTopHz() : 500.0;
+                    if (std::abs (top - liftHz) > 1.0) { liftHz = top; liftLp1.setup (top, sr, kButterQ1); liftLp2.setup (top, sr, kButterQ2); }
                 }
-                double l1u, l2u, lowK;
-                if (specF0 > 0.0) lowK = specBp.bandPass (k);
-                else lowK = specLp2.tick (specLp1.tick (k, l1u), l2u);
-                const double ab = std::abs (lowK);
-                if (ab >= specBB) { specBB = ab; specBBHold = specLowHoldLen; }   // held over a whole cycle of a 40 Hz drum
-                else if (specBBHold > 0) --specBBHold;
-                else specBB = ab + (specBB - ab) * specRel;
-                if (specBB < specBBValley) specBBValley = specBB;
-                else specBBValley += (specBB - specBBValley) * specRise;
-                // the crack arms it; the fundamental must then confirm within 12 ms (an 80 Hz rise takes
-                // a few ms to show). The re-open is marked from the crack, so with enough lookahead the
-                // highs are open before the stroke.
-                if (specEnv > 4.0 * specValley && specEnv > 1e-4 && clock >= lastSpecOnset + minGap && clock >= specArmUntil)
-                {
-                    specArmAt = clock; specArmUntil = clock + (uint64_t) (12 * oneMs); specLowRef = specBBValley;
-                    specValley = specEnv;
-                }
-                if (clock < specArmUntil && specBB > specLowJump * specLowRef && specBB >= 0.5 * thrOpen)
+                double u;
+                const double b = std::abs (liftLp2.tick (liftLp1.tick (k, u), u));
+                // peak, held over a whole cycle of a 40 Hz drum, then a 20 ms release: no ripple
+                if (b >= liftPow) { liftPow = b; liftHold = liftHoldLen; }
+                else if (liftHold > 0) --liftHold;
+                else liftPow = b + (liftPow - b) * liftCoef;
+                const double bdb = 20.0 * std::log10 (std::max (liftPow, 1e-10));
+                if (bdb > liftRef + 1.0 && bdb > -70.0 && clock >= lastLift + minGap)
                 {
                     const uint64_t back = (uint64_t) (3 * oneMs);
-                    const uint64_t at = specArmAt >= back ? specArmAt - back : 0;
+                    const uint64_t at = clock >= back ? clock - back : 0;
                     const uint64_t outNow2 = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
-                    onsetRing[(size_t) (std::max (at, outNow2) & (uint64_t) ringMask)] = 1;
-                    lastSpecOnset = clock;
-                    ++specOnsets;
-                    specArmUntil = 0;
-                    specBBValley = specBB;
+                    markOnset (std::max (at, outNow2), 2);
+                    lastLift = clock;
+                    ++liftMarks; lastLiftAt = std::max (at, outNow2);
                 }
+                // the reference rises slowly (5 ms) and falls 20 dB/s: a stroke's fast rise stands out from it
+                if (bdb > liftRef) liftRef += (bdb - liftRef) * liftRise;
+                else liftRef = std::max (liftRef - liftFall, bdb);
             }
 
             double hp = k, dummy;
@@ -415,7 +407,7 @@ public:
                 haveOnset = true;
                 // mark where the hit lands on the output timeline (or now, if that's already passed)
                 const uint64_t outNow = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
-                onsetRing[(size_t) (std::max (t0, outNow) & (uint64_t) ringMask)] = 1;
+                markOnset (std::max (t0, outNow), 1);
                 if (numPending < kMaxPending)
                 {
                     auto& pd = pending[numPending++];
@@ -531,18 +523,25 @@ public:
             //---------------- output: the gate (or the spectral decay) x leveler
             const float gf = (float) g * laFadeGain;
             const float lf = (float) lg;
-            const bool onsetNow = onsetRing[rAudio] != 0;
+            const uint8_t mark = onsetRing[rAudio];
+            const bool onsetNow = mark != 0, strokeNow = (mark & 1) != 0;
             onsetRing[rAudio] = 0;
             const int attackN = (int) attackSamples;
-            // the spectral decay re-opens its highs over the 2 ms (or the lookahead, if shorter) BEFORE
-            // a stroke, so the stroke's first sample is already full range: the attack is untouched
-            const int peek = la > 0 ? std::min (std::max (attackN, (int) std::lround (0.002 * sr)), la) : 0;
-            const bool onsetAhead = peek > 0 && onsetRing[(rAudio + (size_t) peek) & ringMask] != 0;
+            // the spectral decay is whole again over the lookahead BEFORE a stroke, so the stroke's first
+            // sample is untouched
+            // the next mark still ahead of the output: announce it once, with however much lookahead is left
+            const uint64_t outPos = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
+            while (markCount > 0 && markQ[markHead] <= outPos) { markHead = (markHead + 1) % kMarkQ; --markCount; }
+            bool onsetAhead = false; int peek = 0;
+            if (markCount > 0 && markQ[markHead] != lastAnnounced && markQ[markHead] - outPos <= (uint64_t) la)
+            {
+                onsetAhead = true; peek = (int) (markQ[markHead] - outPos); lastAnnounced = markQ[markHead];
+            }
             const bool gateClosed = stateRing[rAudio] == 0 && g <= gFloor + 1e-9;
             float gated[kMaxChannels];
             for (int c = 0; c < numChannels; ++c) gated[c] = audioRing[(size_t) c * ringSize + rAudio];
             // x * gate gain when the spectral decay is off (bit-exact), its shaped tail when on
-            spectral.tick (gated, numChannels, gf, (float) gFloor * laFadeGain, onsetNow, onsetAhead, peek > 0 ? peek : attackN, gateClosed);
+            spectral.tick (gated, numChannels, gf, (float) gFloor * laFadeGain, onsetNow, onsetAhead, onsetAhead ? peek : attackN, gateClosed, strokeNow);
             if (s.listen)
             {
                 const float kOut = keyRing[rAudio] * laFadeGain;
@@ -689,17 +688,18 @@ private:
     int numCh = 2;
 
     std::vector<float>   audioRing, keyRing, levelRing;
-    std::vector<uint8_t> stateRing, onsetRing;
-    Svf specHp1, specHp2, specLp1, specLp2, specBp;   // the stick-attack detector's high band, and its low band / the fundamental
-    double specF0 = 0.0;
-    double specEnv = 0.0, specValley = 0.0, specBB = 0.0, specBBValley = 0.0, specRel = 0.999, specRise = 0.001;
-    int specHoldLeft = 0, specBBHold = 0, specHoldLen = 96, specLowHoldLen = 1200;
-    uint64_t lastSpecOnset = 0, specArmAt = 0, specArmUntil = 0;
-    double specLowRef = 0.0;
+    std::vector<uint8_t> stateRing, onsetRing;   // onsetRing: 1 = a stroke, 2 = a body lift (spectral only)
+    static constexpr int kMarkQ = 64;
+    uint64_t markQ[kMarkQ] {}, lastAnnounced = UINT64_MAX;
+    int markHead = 0, markCount = 0;
+    Svf liftLp1, liftLp2;
+    int liftHold = 0, liftHoldLen = 1200;
+    double liftPow = 0.0, liftRef = -200.0, liftCoef = 0.99, liftFall = 0.0004, liftRise = 0.004, liftHz = 0.0;
+    uint64_t lastLift = 0;
 public:
-    int specOnsets = 0;   // stick attacks the spectral decay re-opened for (tests)
-    double specLowJump = 1.122;   // how much the low band / fundamental must rise for a stick hit (ratio)
+    int liftMarks = 0; uint64_t lastLiftAt = 0;   // body lifts marked (tests / diagnostics)
 private:
+
     size_t ringSize = 1, ringMask = 0, writePos = 0;
     uint64_t clock = 0;
 
