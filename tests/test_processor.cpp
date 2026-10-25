@@ -120,6 +120,7 @@ static void testStateRoundTrip()
     setParam (a, tg::pid::specOn, 1.0f);
     setParam (a, tg::pid::specFocus, 85.0f);
     setParam (a, tg::pid::specSustain, 35.0f);
+    setParam (a, tg::pid::specTransient, -30.0f);
     MemoryBlock mb;
     a.getStateInformation (mb);
     TheGateProcessor b;

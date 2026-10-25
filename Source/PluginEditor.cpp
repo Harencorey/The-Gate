@@ -272,12 +272,18 @@ void SpectrumView::paint (Graphics& g)
         g.setColour (colours::dim);
         g.strokePath (bl, PathStrokeType (1.2f));
     }
-    g.setColour (colours::accent);
-    for (int k = 0; k < snap.numPartials; ++k)
+    if (snap.bodyHz > 0.0f)
     {
-        const float x = xFor (snap.partials[k].hz);
-        g.drawLine (x, plot.getY(), x, plot.getBottom(), 1.5f);
+        // the body band: what carries the sustain
+        const float xb = xFor (jmax (S::kMinHz, snap.bodyHz));
+        g.setColour (colours::accent.withAlpha (0.12f));
+        g.fillRect (Rectangle<float> (plot.getX(), plot.getY(), xb - plot.getX(), plot.getHeight()));
+        g.setColour (colours::accent);
+        g.drawLine (xb, plot.getY(), xb, plot.getBottom(), 1.5f);
     }
+    g.setColour (colours::dim);
+    g.setFont (FontOptions (9.5f));
+    g.drawText ("attack " + String (snap.transientMs, 0) + " ms", plot.reduced (3.0f, 1.0f), Justification::topRight);
 }
 
 //==============================================================================
@@ -378,9 +384,10 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     makeKnob (levelMax,    tg::pid::levelMax,    "MAX",    "The most any single hit is turned up or down.");
     addAndMakeVisible (glowDrive);
     addAndMakeVisible (spectrum);
-    makeKnob (specFocus,   tg::pid::specFocus,   "FOCUS",   "How fast everything that isn't the source closes in the tail: cymbal wash, hats, snare buzz, room. 0 % = like the plain gate; 100 % = gone almost straight after the attack, leaving the source's own partials.");
-    makeKnob (specSustain, tg::pid::specSustain, "SUSTAIN", "How much longer the source's own partials ring than the gate: 0 % = they close with the gate; 50 % = they ring 30 dB down; 100 % = 60 dB, never into the bleed. The wash stays shut.");
-    spectrum.setTooltip ("What the spectral decay has learned from this track: the source (violet), the bleed when the gate is shut (grey line) and the source's partials (amber), the resonances that ring in the tail.");
+    makeKnob (specTransient, tg::pid::specTransient, "TRANSIENT", "How long each hit's attack stays full range, untouched: learned from the drum's own stick attack. 0 % = as learned; -100 % = half as long; +100 % = twice as long.");
+    makeKnob (specFocus,   tg::pid::specFocus,   "FOCUS",   "After the attack, the highs close from the top down as the hit decays (a low-pass that follows the drum): cymbal wash and hats go first, the drum's tone fades like it does on its own. 0 % = like the plain gate; 100 % = closes fast.");
+    makeKnob (specSustain, tg::pid::specSustain, "SUSTAIN", "How much longer the drum's low end (its body band) rings past the gate: 0 % = closes with the gate; 50 % = rings 30 dB down; 100 % = 60 dB, never into the bleed. The highs never ring on.");
+    spectrum.setTooltip ("What the spectral decay has learned from this track: the source (violet), the bleed when the gate is shut (grey line), the body band that carries the sustain (shaded) and the attack length.");
     makeChoice (glowType, tg::pid::glowType, "TYPE", "TUBE: Glow's tube output stage: the whole sound thickens, softer and rounder as Drive goes up. IRON: Glow's transformer: only the lows (below ~126 Hz) saturate and compress; mids and highs pass clean.");
 
     auto setupOn = [this] (TextButton& b, const char* id, std::unique_ptr<AudioProcessorValueTreeState::ButtonAttachment>& att, const String& tip)
@@ -391,7 +398,7 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
         att = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, id, b);
     };
     setupOn (levelerOn, tg::pid::levelerOn, levelerOnAtt, "Leveler on/off. Evens out soft and loud hits: each hit's peak is measured during the lookahead and its gain set before it plays, so transients are never ramped. Works best with 5 ms lookahead or more.");
-    setupOn (specOn,    tg::pid::specOn,    specOnAtt,    "Spectral decay on/off. The attack stays exactly the plain gate; in the tail, the source's own partials (learned from its hits) ring and everything else closes faster. Zero latency, no phase shift.");
+    setupOn (specOn,    tg::pid::specOn,    specOnAtt,    "Spectral decay on/off. Each hit's attack stays exactly the plain gate; then the highs close from the top down as the drum decays, and its low end can sustain. Zero latency, no phase shift.");
     setupOn (glowOn,    tg::pid::glowOn,    glowOnAtt,    "Micro Glow on/off: Glow's saturation at the output, after the gate and leveler. Oversampled to ~384 kHz, linear-phase, loudness-matched. Switching it never changes the latency.");
 
     listen.setClickingTogglesState (true);
@@ -444,7 +451,7 @@ void TheGateEditor::timerCallback()
     for (auto* k : { &levelAmount, &levelTarget, &levelMax }) { k->slider.setAlpha (lvl); k->label.setAlpha (lvl); }
     glowDrive.setAlpha (glw);
     const float spc = specOn.getToggleState() ? 1.0f : 0.4f;
-    for (auto* k : { &specFocus, &specSustain }) { k->slider.setAlpha (spc); k->label.setAlpha (spc); }
+    for (auto* k : { &specTransient, &specFocus, &specSustain }) { k->slider.setAlpha (spc); k->label.setAlpha (spc); }
     spectrum.setAlpha (spc);
     spectrum.pull();
     glowType.box.setAlpha (glw); glowType.label.setAlpha (glw);
@@ -536,18 +543,18 @@ void TheGateEditor::resized()
         listen.setBounds (bottom.removeFromTop (24).reduced (10, 0));
     }
 
-    levelArea = row2.removeFromLeft (290);
+    levelArea = row2.removeFromLeft (262);
     row2.removeFromLeft (8);
-    specArea = row2.removeFromLeft (352);
+    specArea = row2.removeFromLeft (406);
     row2.removeFromLeft (8);
     glowArea = row2;
     levelerOn.setBounds (levelArea.getRight() - 54, levelArea.getY() + 6, 44, 20);
     specOn.setBounds (specArea.getRight() - 54, specArea.getY() + 6, 44, 20);
     {
         auto a = specArea.reduced (8).withTrimmedTop (22);
-        auto knobs = a.removeFromLeft (172);
-        auto cols = columns (knobs.removeFromTop (120), 2);
-        placeKnob (specFocus, cols[0]); placeKnob (specSustain, cols[1]);
+        auto knobs = a.removeFromLeft (234);
+        auto cols = columns (knobs.removeFromTop (120), 3);
+        placeKnob (specTransient, cols[0]); placeKnob (specFocus, cols[1]); placeKnob (specSustain, cols[2]);
         spectrum.setBounds (a.withTrimmedLeft (4).withTrimmedBottom (4));
     }
     glowOn.setBounds (glowArea.getRight() - 54, glowArea.getY() + 6, 44, 20);
@@ -558,10 +565,10 @@ void TheGateEditor::resized()
     }
     {
         auto a = glowArea.reduced (8, 4).withTrimmedTop (14);
-        auto t = a.removeFromLeft (a.getWidth() * 2 / 5).reduced (10, 0);
+        auto t = a.removeFromLeft (a.getWidth() * 7 / 20).reduced (8, 0);
         t.removeFromTop ((t.getHeight() - 42) / 2);
         glowType.label.setBounds (t.removeFromTop (16));
         glowType.box.setBounds (t.removeFromTop (26));
-        glowDrive.setBounds (a.removeFromLeft (a.getWidth() * 3 / 4).withTrimmedBottom (2));
+        glowDrive.setBounds (a.withTrimmedBottom (2));
     }
 }

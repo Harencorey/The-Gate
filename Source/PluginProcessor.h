@@ -57,7 +57,7 @@ private:
                           * lookahead {}, * keySource {}, * keyHpf {}, * keyHighCut {}, * tracking {}, * listen {},
                           * levelerOn {}, * levelAmount {}, * levelTarget {}, * levelMax {},
                           * glowOn {}, * glowType {}, * glowDrive {}, * glowEnv {},
-                          * specOn {}, * specFocus {}, * specSustain {};
+                          * specOn {}, * specFocus {}, * specSustain {}, * specTransient {};
     } raw;
 
     double currentRate = 0.0;

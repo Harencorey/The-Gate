@@ -1,37 +1,35 @@
 #pragma once
 //==============================================================================
-// The Gate - spectral decay (Phase 3).
+// The Gate - spectral decay (Phase 3, reworked Oct 25 after listening on real drums).
 //
-// The gate's tail, shaped by what the source actually is. Plain C++, no JUCE.
+// The gate's tail, shaped like a real drum decays: the attack stays whole, the highs close
+// first as the hit dies away, the low end carries the sustain. Plain C++, no JUCE.
 //
-// LEARNING (automatic, from the track itself)
-//   Source: ~85 ms of each hit's body (starting 10 ms after the hit, past the attack) is
-//   analysed (FFT) and averaged over hits. Its strongest resonances - a tom's fundamental and
-//   overtones, a kick's body, a snare's shell ring - become the source's PARTIALS (up to 8):
-//   frequency and width, each at least 1/6 octave from the next, each a real peak (the spectrum
-//   drops 9 dB on both sides within a third of an octave - noise bumps don't), within 30 dB of
-//   the strongest, and at least 10 dB above the bleed.
-//   Bleed: the same analysis runs while the gate is shut (everything the mic hears that isn't
-//   the source), plus each partial's own bleed floor.
-//   New partials are learned in the background and switched in at the next hit's attack.
+//   1. TRANSIENT - from each hit's first sample, for as long as the source's attack lasts,
+//      the output is exactly the plain gate (full bandwidth, untouched). The length is LEARNED:
+//      on every hit the source's high band (> 2 kHz) is followed until its crack has fallen
+//      18 dB (or back to what was there before the hit), median of the last 15 hits, 3..50 ms. The
+//      Transient knob scales it (-100 % = half, +100 % = double).
+//   2. THE HIGHS CLOSE FROM THE TOP DOWN - after the transient, a 4-pole low-pass glides down
+//      as the hit's body decays: cutoff = top x 2^(-k x dB the body has fallen since its peak),
+//      k set by Focus (100 % = 1 octave per dB). Everything above the cutoff closes (to the
+//      gate's Range). A hard hit stays bright longer, a soft one closes sooner - like the drum.
+//      The cutoff never goes below the body band.
+//   3. THE BODY - a low source (spectral peak < 1 kHz) has a learned body band: from the
+//      bottom up to where its spectrum falls 30 dB under the peak (max 1.2 kHz). It follows the
+//      gate; Sustain lets ONLY this band ring on past it: down as far as Sustain allows (25 % =
+//      15 dB under its peak, 50 % = 30 dB, 100 % = 60 dB, never into its bleed floor), then
+//      releasing up to 4x slower than the gate. The high end never rings longer than the gate.
 //
-// THE TAIL
-//   The attack is exactly the plain gate (all gains equal, so the output IS x * gate gain):
-//   the transient is never filtered. 5 ms after each hit the tail splits in two:
-//     partials - resonant band-passes locked to the source's partials (0 dB and 0 degrees at
-//                their centre). They follow the gate, and with Sustain they keep ringing past it:
-//                each partial rings down as far as Sustain allows (25 % = 15 dB below its peak,
-//                50 % = 30 dB, 100 % = 60 dB), never into its bleed floor (+6 dB),
-//                then releases up to 4x
-//                slower than the gate's Release: the decay extension.
-//     the rest - everything else: cymbal wash, snare buzz, room. With Focus it closes faster
-//                than the gate (at 100 %, through the whole range in 1/20 of the Release).
-//   output = rest gain * x + sum over partials of (partial gain - rest gain) * w * bandpass(x)
-//   (w: weights so the overlapping partial filters sum to exactly 0 dB at every partial)
-//   So when every gain is equal (Focus 0, Sustain 0, or during the attack) the output is
-//   exactly x * gate gain: zero latency, no phase shift, bit-identical to the plain gate.
-//   When a new stroke comes in while the rest is closed, the rest ramps back up so it's fully
-//   open exactly when the transient arrives (using the lookahead), like the gate's own attack.
+//   output = g x + (gBody - g) x lowBand(x) + (gHigh - g) x (x - movingLowPass(x))
+//   (g = the gate's gain.) So whenever the gains are equal - during the transient, or with
+//   Focus 0 and Sustain 0 - the output IS x x g: bit-identical to the plain gate, no latency,
+//   no phase shift. When a stroke comes in while the highs are closed, they open back up
+//   (gain and cutoff, smoothly) so they're fully open exactly when the transient arrives.
+//
+// LEARNING (automatic, from the track): the source's spectrum (85 ms of each hit's body) and
+// the bleed's (while the gate is shut), for the body band and the display; the transient
+// length from every hit.
 //
 // Real-time safety: prepare() allocates. tick() never allocates or locks; the FFT runs on the
 // audio thread once per finished capture (~40 us for 4096 points), deterministic for renders.
@@ -97,17 +95,16 @@ private:
 };
 
 //------------------------------------------------------------------------------
-struct PartialInfo { float hz = 0.0f, q = 0.0f, levelDb = -120.0f; };
-
-// What the UI shows: the learned source and bleed spectra and the partials.
+// What the UI shows: the learned source and bleed spectra, the body band and the transient.
 struct SpectrumSnapshot
 {
     static constexpr int kPoints = 96;
     static constexpr float kMinHz = 30.0f, kMaxHz = 16000.0f;
     float sourceDb[kPoints] {};
     float bleedDb[kPoints] {};
-    PartialInfo partials[8] {};
-    int numPartials = 0, hitsLearned = 0;
+    float bodyHz = 0.0f;        // top of the body band (0 = none)
+    float transientMs = 0.0f;   // learned attack length (before the Transient knob)
+    int hitsLearned = 0;
     bool bleedLearned = false;
 };
 
@@ -115,14 +112,14 @@ struct SpectrumSnapshot
 class SpectralDecay
 {
 public:
-    static constexpr int kMaxPartials = 8;
     static constexpr int kMaxCh = 8;
 
     struct Settings
     {
-        bool  on      = false;
-        float focus   = 50.0f;   // 0..100 %: how fast everything that isn't the source closes
-        float sustain = 0.0f;    // 0..100 %: how much longer the source's partials ring
+        bool  on        = false;
+        float focus     = 50.0f;   // 0..100 %: how fast the highs close after the transient
+        float sustain   = 0.0f;    // 0..100 %: how much longer the low end (body band) rings
+        float transient = 0.0f;    // -100..+100 %: shorter / longer than the learned attack
     };
 
     void prepare (double sampleRate, int maxChannels)
@@ -137,33 +134,40 @@ public:
         re.assign ((size_t) fftSize, 0.0); im.assign ((size_t) fftSize, 0.0);
         srcPow.assign ((size_t) fftSize / 2 + 1, 0.0);
         bleedPow.assign ((size_t) fftSize / 2 + 1, 0.0);
-        splitLen = (int) std::lround (0.005 * sr);
         captureDelay = (int) std::lround (0.010 * sr);
         bleedSettle = (int) std::lround (0.020 * sr);
         bleedEvery = (int) std::lround (0.250 * sr);
-        envRel = std::exp (-1.0 / (0.010 * sr));
+        bodyEnvRel = std::exp (-1.0 / (0.030 * sr));     // smooth enough for a 40 Hz body
+        hfEnvRel = std::exp (-1.0 / (0.001 * sr));
         floorFall = std::exp (-1.0 / (0.050 * sr));
         floorRise = std::exp (-1.0 / (3.0 * sr));
+        fcSmooth = std::exp (-1.0 / (0.004 * sr));
         fadeStep = 1.0 / std::max (1.0, 0.010 * sr);
+        closeLen = std::max (1, (int) std::lround (0.003 * sr));
+        fTop = std::min (20000.0, 0.45 * sr);
+        hfSplit.setup (2000.0, sr, 0.70710678);
         reset();
     }
 
     // Also forgets everything learned.
     void reset()
     {
-        for (auto& ch : bp) for (auto& f : ch) f.reset();
-        for (auto& f : lp) f.reset();
-        bodyHz = pendingBodyHz = 0.0;
-        for (int k = 0; k < kMaxPartials; ++k) { env[k] = peak[k] = 0.0; floorLog[k] = -200.0; own[k] = 0.0; holding[k] = false; }
-        numPartials = 0;
-        pendingCount = -1;
+        for (int c = 0; c < kMaxCh; ++c) { lp[c].reset(); mv1[c].reset(); mv2[c].reset(); }
+        hfSplit.reset();
+        bodyHz = 0.0; pendingBodyHz = -1.0;
+        haveBody = false;
         std::fill (srcPow.begin(), srcPow.end(), 0.0);
         std::fill (bleedPow.begin(), bleedPow.end(), 0.0);
         hits = bleeds = 0;
         capMode = idle; capPos = 0; capWait = -1;
         closedRun = 0; sinceBleed = bleedEvery;
-        phase = tail; splitLeft = 0; sinceSplit = 0; rampLeft = rampLen = 0; rampFrom = 1.0f;
-        gRest = 1.0f;
+        phase = tail; trLeft = 0; closeLeft = 0;
+        rampLeft = rampLen = 0; rampFromH = 1.0; rampFromFc = fTop;
+        h = 1.0; fc = fcTarget = fTop; retuneIn = 0;
+        envB = peakB = 0.0; floorB = -200.0; own = 0.0; holding = false;
+        envH = peakH = 0.0; floorH = -200.0; measuring = false; measPos = 0;
+        learnedTrMs = 0.0; trCount = 0;
+        setMoving (fTop);
         mix = set.on ? 1.0 : 0.0;
     }
 
@@ -171,14 +175,13 @@ public:
     {
         set = ns;
         const double rel = std::max (1.0, (double) releaseMsIn);
-        const double F = std::clamp (set.focus * 0.01, 0.0, 1.0);
+        focusK = 1.0 * std::clamp (set.focus * 0.01, 0.0, 1.0);           // octaves per dB of body decay
         span = rangeDbIn <= -80.0f ? 80.0 : std::max (0.0, -(double) rangeDbIn);
-        // the rest: F x span dB per (Release x (1 - 0.95 F)), so Focus 0 = never faster than the gate
-        restDbPerSample = F * span / (std::max (0.003 * sr, rel * 0.001 * sr * (1.0 - 0.95 * F)));
         const double S = std::clamp (set.sustain * 0.01, 0.0, 1.0);
         sustainBlend = std::min (1.0, S * 10.0);
         ringLimit = std::pow (10.0, -60.0 * S / 20.0);   // Sustain 25 %: ring down to -15 dB, 50 %: -30, 100 %: -60
-        partialRel = std::pow (10.0, -span / (20.0 * std::max (1.0, rel * 0.001 * sr * (1.0 + 3.0 * S))));
+        bodyRel = std::pow (10.0, -span / (20.0 * std::max (1.0, rel * 0.001 * sr * (1.0 + 3.0 * S))));
+        trScale = std::pow (2.0, std::clamp (set.transient * 0.01, -1.0, 1.0));
     }
 
     //--------------------------------------------------------------------------
@@ -192,86 +195,90 @@ public:
         float in[kMaxCh];
         for (int c = 0; c < channels; ++c) in[c] = x[c];
 
-        //---------------- the body band (always running): everything below the body crossover
-        double lpOut[kMaxCh];
-        for (int c = 0; c < channels; ++c) { double hpUnused; lpOut[c] = bodyHz > 0.0 ? lp[c].tick (x[c], hpUnused) : 0.0; }
-
-        //---------------- partial band-passes (always running) and their envelopes
-        double bpOut[kMaxPartials][kMaxCh];
-        for (int k = 0; k < numPartials; ++k)
+        //---------------- filters (always running, so switching never clicks)
+        double low[kMaxCh], mov[kMaxCh];
+        double bAbs = 0.0, mono = 0.0;
+        for (int c = 0; c < channels; ++c)
         {
-            double a = 0.0;
-            for (int c = 0; c < channels; ++c)
-            {
-                bpOut[k][c] = bp[c][k].bandPass (x[c]);
-                a = std::max (a, std::abs (bpOut[k][c]));
-            }
-            env[k] = a > env[k] ? a : a + (env[k] - a) * envRel;
-            if (gateClosed)
-            {
-                // minimum tracking: falls fast to the quietest level between hits, creeps up slowly,
-                // so a source tail still ringing when the gate shuts can't pass itself off as bleed
-                const double d = lin2db (env[k]);
-                if (floorLog[k] < -150.0)  floorLog[k] = d;
-                else if (d < floorLog[k])  floorLog[k] = d + (floorLog[k] - d) * floorFall;
-                else                       floorLog[k] = d + (floorLog[k] - d) * floorRise;
-            }
+            double unused;
+            low[c] = haveBody ? lp[c].tick (x[c], unused) : 0.0;
+            mov[c] = mv2[c].tick (mv1[c].tick (x[c], unused), unused);
+            bAbs = std::max (bAbs, std::abs (haveBody ? low[c] : (double) x[c]));
+            mono += x[c];
+        }
+        mono /= channels;
+        double hfOut; hfSplit.tick (mono, hfOut);
+
+        // body envelope (drives the moving cutoff and the Sustain ring) and its bleed floor
+        envB = bAbs > envB ? bAbs : bAbs + (envB - bAbs) * bodyEnvRel;
+        const double aH = std::abs (hfOut);
+        envH = aH > envH ? aH : aH + (envH - aH) * hfEnvRel;
+        if (gateClosed)
+        {
+            // minimum tracking: a source tail still ringing when the gate shuts isn't bleed
+            trackFloor (floorB, envB);
+            trackFloor (floorH, envH);
         }
 
         //---------------- hit timing
+        const double trSamples = std::clamp (transientMs() * trScale, 1.0, 100.0) * 0.001 * sr;
         if (onsetNow)
         {
-            if (pendingCount >= 0) applyPending();   // new partials switch in on an attack (all gains equal here)
-            phase = hold; splitLeft = splitLen;
-            for (int k = 0; k < numPartials; ++k) { own[k] = 1.0; peak[k] = 0.0; holding[k] = true; }
-            if (rampLeft == 0 && gRest < g) { rampFrom = gRest; rampLen = rampLeft = std::max (1, ramp); }   // no lookahead: ramp after
-            if (capMode == source || capMode == bleed) capMode = idle;   // the next hit cuts the capture off
+            if (pendingBodyHz >= 0.0) applyBody();       // a new body band switches in on an attack (gains equal)
+            phase = transient; trLeft = (int) std::lround (trSamples); closeLeft = 0;
+            peakB = envB; holding = true; own = 1.0;
+            if (rampLeft == 0 && h < 1.0) startRamp (ramp);   // no lookahead: open right after
+            measuring = true; measPos = 0; peakH = envH; preH = envH;   // learn this hit's attack length
+            if (capMode == source || capMode == bleed) capMode = idle;
             capWait = captureDelay;
         }
-        else if (onsetAhead && gRest < 1.0f && rampLeft == 0)
+        else if (onsetAhead && rampLeft == 0 && (h < 1.0 || fc < fTop * 0.99))
         {
-            // a stroke is coming while the rest is closed: ramp it back up so it's fully open
-            // exactly when the transient arrives (like the gate's own attack)
-            rampFrom = gRest; rampLen = rampLeft = std::max (1, ramp);
-            phase = hold; splitLeft = rampLen + splitLen;
+            startRamp (ramp);                              // fully open exactly when the transient arrives
+            phase = transient; trLeft = std::max (1, ramp) + (int) std::lround (trSamples); closeLeft = 0;
         }
 
-        //---------------- the rest's gain
-        float base;
-        if (phase == hold)
+        //---------------- the highs: open through the transient, then close from the top down
+        bool untouched = false;   // this sample is still inside the attack window
+        if (phase == transient)
         {
-            base = g;
-            if (--splitLeft <= 0) { phase = tail; sinceSplit = 0; }
-        }
-        else
-        {
-            ++sinceSplit;
-            const double restDb = -restDbPerSample * (double) sinceSplit;
-            base = std::min (g, std::max (gFloor, restDb <= -span ? gFloor : (float) std::pow (10.0, restDb / 20.0)));
+            peakB = std::max (peakB, envB);
+            untouched = true;
+            if (--trLeft <= 0) { phase = tail; closeLeft = focusK > 0.0 ? closeLen : 0; }
         }
         if (rampLeft > 0)
         {
             --rampLeft;
-            const double p = 1.0 - (double) rampLeft / (double) rampLen;
-            gRest = std::min (base, (float) (rampFrom + (1.0 - rampFrom) * (0.5 - 0.5 * std::cos (M_PI * p))));
+            const double p = 1.0 - (double) rampLeft / (double) rampLen, w = 0.5 - 0.5 * std::cos (M_PI * p);
+            h = rampFromH + (1.0 - rampFromH) * w;
+            fcTarget = fc = std::exp (std::log (rampFromFc) + (std::log (fTop) - std::log (rampFromFc)) * w);
+            if (rampLeft == 0) { h = 1.0; fc = fcTarget = fTop; }
+            retuneIn = 0;
         }
-        else gRest = base;
-
-        //---------------- each partial's gain: follows the gate; with Sustain it rings on
-        float gk[kMaxPartials];
-        for (int k = 0; k < numPartials; ++k)
+        else if (phase == tail && focusK > 0.0 && ! untouched)
         {
-            peak[k] = std::max (peak[k], env[k]);
-            if (phase != hold && holding[k])
-            {
-                const double floorLin = floorLog[k] < -150.0 ? 0.0 : db2lin (floorLog[k]);
-                if (! (env[k] > std::max (2.0 * floorLin, peak[k] * ringLimit))) holding[k] = false;   // into its bleed floor, or rung as far as Sustain allows
-            }
-            if (! holding[k]) own[k] *= partialRel;
-            const double sus = std::max ((double) g, own[k]);
-            gk[k] = phase == hold ? g   // the attack is exactly the plain gate
-                                  : std::max (gRest, std::max (gFloor, (float) (g + sustainBlend * (sus - g))));
+            if (closeLeft > 0) { --closeLeft; h = (double) closeLeft / closeLen; }   // 3 ms fade into the closed highs
+            else h = 0.0;
+            const double fallenDb = peakB > 1e-12 ? std::min (0.0, 20.0 * std::log10 (std::max (envB, 1e-12) / peakB)) : 0.0;
+            fcTarget = std::max (fcMin(), fTop * std::pow (2.0, focusK * fallenDb));
+            fc = fcTarget + (fc - fcTarget) * fcSmooth;
         }
+        else if (focusK <= 0.0) { h = 1.0; fc = fcTarget = fTop; }
+        if (--retuneIn <= 0) { setMoving (fc); retuneIn = 16; }
+
+        //---------------- the body: follows the gate; with Sustain it rings on
+        float gB = g;
+        if (haveBody && phase == tail && ! untouched && sustainBlend > 0.0)
+        {
+            if (holding)
+            {
+                const double floorLin = floorB < -150.0 ? 0.0 : std::pow (10.0, floorB / 20.0);
+                if (! (envB > std::max (2.0 * floorLin, peakB * ringLimit))) holding = false;   // into its bleed floor, or as far as Sustain allows
+            }
+            if (! holding) own *= bodyRel;
+            gB = (float) std::max ((double) g, g + sustainBlend * (std::max ((double) g, own) - g));
+        }
+        const float gH = std::max (gFloor, std::min (g, (float) (g * h)));
 
         //---------------- output
         const bool wantOn = set.on;
@@ -281,41 +288,80 @@ public:
         {
             const float plain = x[c] * g;   // exactly the gate's own output
             if (mix <= 0.0) { x[c] = plain; continue; }
-            // the rest closes at gRest; the source's body band follows the gate exactly like the plain
-            // gate (so the drum keeps its weight); partials ring relative to whichever band they sit in
-            float y = x[c] * gRest;
-            if (bodyHz > 0.0) y += (g - gRest) * (float) lpOut[c];
-            for (int k = 0; k < numPartials; ++k)
-            {
-                const float base = inBody[k] ? g : gRest;
-                y += (gk[k] - base) * weight[k] * (float) bpOut[k][c];   // exactly 0 when the gains are equal
-            }
+            float y = plain;
+            if (haveBody) y += (gB - g) * (float) low[c];                // exactly 0 when the gains are equal
+            y += (gH - g) * (float) (x[c] - mov[c]);                    // exactly 0 when the gains are equal
             x[c] = mix >= 1.0 ? y : plain + (float) mix * (y - plain);
         }
 
-        //---------------- learning: captures of the source (hit bodies) and the bleed (gate shut)
+        //---------------- learning
+        learnTransient (gateClosed);
         learn (in, channels, gateClosed, g);
     }
 
     SpscFifo<SpectrumSnapshot, 4> snapshots;   // audio -> UI
 
     // read-only access for tests and the UI
-    int numLearnedPartials() const noexcept { return numPartials; }
-    float partialHz (int k) const noexcept { return k < numPartials ? partials[k].hz : 0.0f; }
     int hitsLearned() const noexcept { return hits; }
     int bleedsLearned() const noexcept { return bleeds; }
-    float restGain() const noexcept { return gRest; }
-    float bodyTopHz() const noexcept { return (float) bodyHz; }   // 0 = no body band (a high source)
-    // the learned source / bleed spectrum at a frequency (dB, for tests and analysis)
+    float bodyTopHz() const noexcept { return (float) bodyHz; }          // 0 = no body band
+    double transientMs() const noexcept { return trCount > 0 ? learnedTrMs : 15.0; }   // learned attack (15 ms until learned)
+    double cutoffHz() const noexcept { return fc; }
+    double highGain() const noexcept { return h; }
     double sourceDbAt (double hz) const noexcept { const size_t i = (size_t) std::lround (hz * fftSize / sr); return 10.0 * std::log10 (std::max (srcPow[std::min (i, srcPow.size() - 1)], 1e-30)); }
     double bleedDbAt (double hz) const noexcept { const size_t i = (size_t) std::lround (hz * fftSize / sr); return 10.0 * std::log10 (std::max (bleedPow[std::min (i, bleedPow.size() - 1)], 1e-30)); }
 
 private:
     enum CapMode { idle, source, bleed };
-    enum Phase { tail, hold };
+    enum Phase { tail, transient };
 
-    static double lin2db (double v) noexcept { return 20.0 * std::log10 (std::max (v, 1e-10)); }
-    static double db2lin (double d) noexcept { return std::pow (10.0, d / 20.0); }
+    void trackFloor (double& floorDb, double env) noexcept
+    {
+        const double d = 20.0 * std::log10 (std::max (env, 1e-10));
+        if (floorDb < -150.0)  floorDb = d;
+        else if (d < floorDb)  floorDb = d + (floorDb - d) * floorFall;
+        else                   floorDb = d + (floorDb - d) * floorRise;
+    }
+
+    double fcMin() const noexcept { return haveBody ? std::min (1500.0, bodyHz * 1.25) : 300.0; }
+
+    void setMoving (double f) noexcept
+    {
+        for (int c = 0; c < numCh; ++c) { mv1[c].setup (f, sr, 0.5411961); mv2[c].setup (f, sr, 1.3065630); }   // 4-pole Butterworth
+    }
+
+    void startRamp (int ramp) noexcept
+    {
+        rampFromH = h; rampFromFc = std::max (20.0, fc);
+        rampLen = rampLeft = std::max (1, ramp);
+    }
+
+    // The attack length: how long after the hit the high band takes to fall 18 dB under its
+    // peak (or into its bleed floor). Averaged over hits.
+    void learnTransient (bool gateClosed) noexcept
+    {
+        if (! measuring) return;
+        ++measPos;
+        peakH = std::max (peakH, envH);
+        const double floorLin = floorH < -150.0 ? 0.0 : std::pow (10.0, floorH / 20.0);
+        const int minPos = (int) (0.002 * sr), maxPos = (int) (0.050 * sr);
+        bool done = false;
+        // over when the crack has fallen 18 dB, or back to what the high band had before the hit
+        if (measPos >= minPos && (envH < peakH * 0.1259 || envH < 1.5 * preH || envH < 2.0 * floorLin)) done = true;
+        if (measPos >= maxPos) done = true;
+        if (gateClosed) { measuring = false; return; }     // gate shut before the attack ended: not a usable hit
+        if (! done) return;
+        measuring = false;
+        // the median of the last 15 hits: a hit with a crash on it (the high band never settles)
+        // is an outlier, not the drum's attack
+        trHist[(size_t) (trCount % kTrHist)] = std::clamp (measPos * 1000.0 / sr, 3.0, 50.0);
+        ++trCount;
+        const int n = std::min (trCount, kTrHist);
+        std::array<double, kTrHist> tmp {};
+        std::copy (trHist.begin(), trHist.begin() + n, tmp.begin());
+        std::nth_element (tmp.begin(), tmp.begin() + n / 2, tmp.begin() + n);
+        learnedTrMs = tmp[(size_t) (n / 2)];
+    }
 
     void learn (const float* in, int channels, bool gateClosed, float g) noexcept
     {
@@ -323,17 +369,11 @@ private:
         for (int c = 0; c < channels; ++c) m += in[c];
         m /= (float) channels;
 
-        // source: start captureDelay after the hit, if the gate is properly open
         if (capWait >= 0 && --capWait < 0 && g >= 0.5f) { capMode = source; capPos = 0; }
-
-        // bleed: once the gate has been shut for 20 ms, at most every 250 ms
         closedRun = gateClosed ? closedRun + 1 : 0;
         ++sinceBleed;
-        if (capMode == idle && capWait < 0 && closedRun >= bleedSettle && sinceBleed >= bleedEvery)
-        {
-            capMode = bleed; capPos = 0;
-        }
-        if (capMode == bleed && ! gateClosed) capMode = idle;   // the gate opened: not bleed any more
+        if (capMode == idle && capWait < 0 && closedRun >= bleedSettle && sinceBleed >= bleedEvery) { capMode = bleed; capPos = 0; }
+        if (capMode == bleed && ! gateClosed) capMode = idle;
 
         if (capMode != idle)
         {
@@ -357,158 +397,49 @@ private:
         for (size_t i = 0; i <= (size_t) fftSize / 2; ++i)
         {
             const double p = re[i] * re[i] + im[i] * im[i];
-            // source: average over the last few hits. bleed: biased toward the quieter captures
-            // (the same minimum-tracking idea), so source tails heard while the gate was shut
-            // don't count as bleed
             const double a = count == 0 ? 1.0 : (isSource ? 0.25 : (p < acc[i] ? 0.5 : 0.1));
             acc[i] = acc[i] + a * (p - acc[i]);
         }
         ++count;
-        if (hits >= 2) pickPartials();
+        if (hits >= 2) findBody();
         publishSnapshot();
     }
 
-    // The source's strongest resonances (see the header for the rules).
-    void pickPartials() noexcept
+    // The body band: a low source (spectral peak below 1 kHz) keeps everything from the bottom up
+    // to where its spectrum (max over a sixth of an octave) has fallen 30 dB under the peak.
+    void findBody() noexcept
     {
-        const int nyq = fftSize / 2;
         const double binHz = sr / fftSize;
-        auto dbAt = [&] (const std::vector<double>& v, int i) { return 10.0 * std::log10 (std::max (v[(size_t) i], 1e-30)); };
-        const int lo = std::max (3, (int) std::ceil (40.0 / binHz)), hi = std::min (nyq - 3, (int) (12000.0 / binHz));
-        double maxDb = -400.0;
-        int maxBin = lo;
-        for (int i = lo; i <= hi; ++i) if (dbAt (srcPow, i) > maxDb) { maxDb = dbAt (srcPow, i); maxBin = i; }
-
-        // the body band: a low source (peak below 400 Hz) keeps everything from the bottom up to where
-        // its spectrum (max over a sixth of an octave) has fallen 30 dB under the peak, at most 800 Hz.
-        // Real drums aren't a few clean partials: the shell's broad low-mid resonance is the drum's
-        // weight, and closing it with the wash made toms thin.
-        pendingBodyHz = 0.0;
-        if (maxBin * binHz < 400.0)
+        auto dbAt = [&] (int i) { return 10.0 * std::log10 (std::max (srcPow[(size_t) i], 1e-30)); };
+        const int lo = std::max (3, (int) std::ceil (40.0 / binHz)), hi = std::min (fftSize / 2 - 3, (int) (12000.0 / binHz));
+        double maxDb = -400.0; int maxBin = lo;
+        for (int i = lo; i <= hi; ++i) if (dbAt (i) > maxDb) { maxDb = dbAt (i); maxBin = i; }
+        double top = 0.0;
+        if (maxBin * binHz < 1000.0)
         {
             const double sixth = std::pow (2.0, 1.0 / 6.0);
             int last = maxBin;
-            for (int i = maxBin; i <= std::min (hi, (int) (800.0 / binHz)); ++i)
+            for (int i = maxBin; i <= std::min (hi, (int) (1200.0 / binHz)); ++i)
             {
                 double m = -400.0;
-                for (int j = std::max (lo, (int) (i / sixth)); j <= std::min (hi, (int) std::ceil (i * sixth)); ++j) m = std::max (m, dbAt (srcPow, j));
+                for (int j = std::max (lo, (int) (i / sixth)); j <= std::min (hi, (int) std::ceil (i * sixth)); ++j) m = std::max (m, dbAt (j));
                 if (m >= maxDb - 30.0) last = i; else break;
             }
-            pendingBodyHz = last * binHz;
+            top = last * binHz;
         }
-
-        struct Cand { int bin; double db; };
-        Cand cand[64]; int nc = 0;
-        const double third = std::pow (2.0, 1.0 / 3.0);
-        for (int i = lo; i <= hi && nc < 64; ++i)
-        {
-            const double d = dbAt (srcPow, i);
-            if (d < maxDb - 30.0) continue;
-            if (d < dbAt (srcPow, i - 1) || d < dbAt (srcPow, i + 1) || d < dbAt (srcPow, i - 2) || d < dbAt (srcPow, i + 2)) continue;
-            // a resonance, not a noise bump: the spectrum drops at least 9 dB on BOTH sides
-            // within a third of an octave (averaged noise wobbles by only a few dB)
-            const int a = std::max (1, (int) (i / third)), b = std::min (nyq, (int) std::ceil (i * third));
-            double leftMin = d, rightMin = d;
-            for (int j = a; j < i; ++j)  leftMin  = std::min (leftMin,  dbAt (srcPow, j));
-            for (int j = i + 1; j <= b; ++j) rightMin = std::min (rightMin, dbAt (srcPow, j));
-            if (d - leftMin < 9.0 || d - rightMin < 9.0) continue;
-            if (bleeds > 0 && d - dbAt (bleedPow, i) < 10.0) continue;           // well above the bleed there
-            cand[nc++] = { i, d };
-        }
-        std::sort (cand, cand + nc, [] (const Cand& p, const Cand& q) { return p.db > q.db; });
-
-        int n = 0;
-        PartialInfo out[kMaxPartials];
-        for (int c = 0; c < nc && n < kMaxPartials; ++c)
-        {
-            const int i = cand[c].bin;
-            // parabolic peak interpolation
-            const double y0 = dbAt (srcPow, i - 1), y1 = dbAt (srcPow, i), y2 = dbAt (srcPow, i + 1);
-            const double den = y0 - 2.0 * y1 + y2;
-            const double off = std::abs (den) > 1e-12 ? std::clamp (0.5 * (y0 - y2) / den, -0.5, 0.5) : 0.0;
-            const double hz = (i + off) * binHz;
-            bool tooClose = false;
-            for (int k = 0; k < n; ++k)
-                if (std::abs (std::log2 (hz / out[k].hz)) < 1.0 / 6.0) tooClose = true;
-            if (tooClose) continue;
-            // width at -3 dB (within a third of an octave each side)
-            const double lim = std::pow (2.0, 1.0 / 3.0);
-            int l = i, r = i;
-            while (l > (int) (i / lim) && dbAt (srcPow, l) > y1 - 3.0) --l;
-            while (r < std::min (nyq, (int) (i * lim)) && dbAt (srcPow, r) > y1 - 3.0) ++r;
-            const double bw = std::max (1.0, (double) (r - l)) * binHz;
-            out[n++] = { (float) hz, (float) std::clamp (hz / bw, 3.0, 25.0), (float) cand[c].db };
-        }
-        for (int k = 0; k < n; ++k) pending[k] = out[k];
-        pendingCount = n;
-        if (numPartials == 0) applyPending();   // nothing playing through partials yet: switch now
+        pendingBodyHz = top;
+        if (! haveBody && bodyHz <= 0.0) applyBody();   // nothing to switch over from: now
     }
 
-    void applyPending() noexcept
+    void applyBody() noexcept
     {
-        for (int k = 0; k < pendingCount; ++k)
-        {
-            const bool moved = k >= numPartials || std::abs (std::log2 (pending[k].hz / std::max (1.0f, partials[k].hz))) > 0.04;
-            partials[k] = pending[k];
-            for (int c = 0; c < numCh; ++c) bp[c][k].setup (partials[k].hz, sr, partials[k].q);
-            if (moved) { floorLog[k] = -200.0; env[k] = 0.0; for (int c = 0; c < numCh; ++c) bp[c][k].reset(); }
-        }
-        numPartials = pendingCount;
-        pendingCount = -1;
-        const double xo = std::min (1000.0, pendingBodyHz * 1.25);   // crossover a little above the body's top
-        if (pendingBodyHz > 0.0 && std::abs (std::log2 (xo / std::max (1.0, bodyHz * 1.25))) > 0.1)
-            for (int c = 0; c < numCh; ++c) { lp[c].setup (xo, sr, 0.70710678); if (bodyHz <= 0.0) lp[c].reset(); }
-        bodyHz = pendingBodyHz;
-        for (int k = 0; k < numPartials; ++k) inBody[k] = bodyHz > 0.0 && partials[k].hz < bodyHz * 1.25;
-        solveWeights();
-    }
-
-    // Neighbouring partial filters overlap, so their sum would come out a little hot. Real weights
-    // w (least squares) make sum_j w_j H_j(f_k) = 1 at every partial's centre: the partials alone
-    // reproduce the source at 0 dB.
-    void solveWeights() noexcept
-    {
-        const int n = numPartials;
-        double re_[kMaxPartials][kMaxPartials], im_[kMaxPartials][kMaxPartials];
-        for (int k = 0; k < n; ++k)
-            for (int j = 0; j < n; ++j)
-            {
-                // band-pass (bilinear, prewarped) at partial k's centre: (jx/Q) / (1 - x^2 + jx/Q)
-                const double x = std::tan (M_PI * partials[k].hz / sr) / std::tan (M_PI * partials[j].hz / sr);
-                const double q = partials[j].q, ar = 1.0 - x * x, ai = x / q;
-                const double den = ar * ar + ai * ai;
-                re_[k][j] = (ai * ai) / den;          // (j x/Q) * conj(ar + j ai) / den
-                im_[k][j] = (ai * ar) / den;
-            }
-        // normal equations: M w = b, M = Re(A^H A), b = Re(A^H 1)
-        double M[kMaxPartials][kMaxPartials + 1];
-        for (int a = 0; a < n; ++a)
-        {
-            for (int b = 0; b < n; ++b)
-            {
-                double m = 0.0;
-                for (int k = 0; k < n; ++k) m += re_[k][a] * re_[k][b] + im_[k][a] * im_[k][b];
-                M[a][b] = m;
-            }
-            double r = 0.0;
-            for (int k = 0; k < n; ++k) r += re_[k][a];
-            M[a][n] = r;
-        }
-        for (int c = 0; c < n; ++c)   // Gaussian elimination, partial pivoting
-        {
-            int piv = c;
-            for (int r = c + 1; r < n; ++r) if (std::abs (M[r][c]) > std::abs (M[piv][c])) piv = r;
-            for (int t = 0; t <= n; ++t) std::swap (M[c][t], M[piv][t]);
-            if (std::abs (M[c][c]) < 1e-12) continue;
-            for (int r = 0; r < n; ++r)
-                if (r != c)
-                {
-                    const double f = M[r][c] / M[c][c];
-                    for (int t = c; t <= n; ++t) M[r][t] -= f * M[c][t];
-                }
-        }
-        for (int k = 0; k < n; ++k)
-            weight[k] = std::abs (M[k][k]) > 1e-12 ? (float) std::clamp (M[k][n] / M[k][k], 0.3, 1.5) : 1.0f;
+        const double nb = pendingBodyHz;
+        pendingBodyHz = -1.0;
+        if (nb <= 0.0) { haveBody = false; bodyHz = 0.0; return; }
+        const double xo = std::min (1500.0, nb * 1.25);   // crossover a little above the body's top
+        if (! haveBody || std::abs (std::log2 (xo / std::max (1.0, bodyHz * 1.25))) > 0.1)
+            for (int c = 0; c < numCh; ++c) { lp[c].setup (xo, sr, 0.70710678); if (! haveBody) lp[c].reset(); }
+        bodyHz = nb; haveBody = true;
     }
 
     void publishSnapshot() noexcept
@@ -519,14 +450,13 @@ private:
         {
             const double f = SpectrumSnapshot::kMinHz * std::pow ((double) SpectrumSnapshot::kMaxHz / SpectrumSnapshot::kMinHz, (p + 0.5) / SpectrumSnapshot::kPoints);
             const int a = std::max (1, (int) (f / std::pow (2.0, 1.0 / 24.0) / binHz)), b = std::min (fftSize / 2, std::max (a, (int) (f * std::pow (2.0, 1.0 / 24.0) / binHz)));
-            double s = 0, bl = 0;
-            for (int i = a; i <= b; ++i) { s = std::max (s, srcPow[(size_t) i]); bl = std::max (bl, bleedPow[(size_t) i]); }
-            snap.sourceDb[p] = (float) (10.0 * std::log10 (std::max (s, 1e-30)));
+            double sv = 0, bl = 0;
+            for (int i = a; i <= b; ++i) { sv = std::max (sv, srcPow[(size_t) i]); bl = std::max (bl, bleedPow[(size_t) i]); }
+            snap.sourceDb[p] = (float) (10.0 * std::log10 (std::max (sv, 1e-30)));
             snap.bleedDb[p]  = (float) (10.0 * std::log10 (std::max (bl, 1e-30)));
         }
-        const int n = pendingCount >= 0 ? pendingCount : numPartials;
-        for (int k = 0; k < n; ++k) snap.partials[k] = pendingCount >= 0 ? pending[k] : partials[k];
-        snap.numPartials = n;
+        snap.bodyHz = (float) (pendingBodyHz >= 0.0 ? pendingBodyHz : bodyHz);
+        snap.transientMs = (float) transientMs();
         snap.hitsLearned = hits;
         snap.bleedLearned = bleeds > 0;
         snapshots.push (snap);
@@ -536,24 +466,26 @@ private:
     double sr = 48000.0;
     int numCh = 2;
 
-    // partials
-    Svf bp[kMaxCh][kMaxPartials];
-    Svf lp[kMaxCh];                       // the body band
-    double bodyHz = 0.0, pendingBodyHz = 0.0;
-    bool inBody[kMaxPartials] {};
-    PartialInfo partials[kMaxPartials], pending[kMaxPartials];
-    int numPartials = 0, pendingCount = -1;
-    float weight[kMaxPartials] { 1, 1, 1, 1, 1, 1, 1, 1 };
-    double env[kMaxPartials] {}, peak[kMaxPartials] {}, floorLog[kMaxPartials] {}, own[kMaxPartials] {};
-    bool holding[kMaxPartials] {};
-    double envRel = 0.999, floorFall = 0.9996, floorRise = 0.999993;
+    // filters
+    Svf lp[kMaxCh];                  // the body band
+    Svf mv1[kMaxCh], mv2[kMaxCh];    // the moving low-pass (4-pole)
+    Svf hfSplit;                     // > 2 kHz, for learning the attack
+    double bodyHz = 0.0, pendingBodyHz = -1.0;
+    bool haveBody = false;
 
-    // gains
+    // state
     Phase phase = tail;
-    int splitLen = 240, splitLeft = 0, rampLeft = 0, rampLen = 0;
-    int64_t sinceSplit = 0;
-    float gRest = 1.0f, rampFrom = 1.0f;
-    double span = 80.0, restDbPerSample = 0.0, partialRel = 0.999, sustainBlend = 0.0, ringLimit = 1.0;
+    int trLeft = 0, closeLeft = 0, closeLen = 144, rampLeft = 0, rampLen = 0, retuneIn = 0;
+    double h = 1.0, fc = 20000.0, fcTarget = 20000.0, fTop = 20000.0, rampFromH = 1.0, rampFromFc = 20000.0;
+    double envB = 0.0, peakB = 0.0, floorB = -200.0, own = 0.0;
+    bool holding = false;
+    double envH = 0.0, peakH = 0.0, preH = 0.0, floorH = -200.0;
+    bool measuring = false; int measPos = 0;
+    static constexpr int kTrHist = 15;
+    std::array<double, kTrHist> trHist {};
+    double learnedTrMs = 0.0; int trCount = 0;
+    double bodyEnvRel = 0.999, hfEnvRel = 0.98, floorFall = 0.9996, floorRise = 0.999993, fcSmooth = 0.995;
+    double span = 80.0, focusK = 0.0, bodyRel = 0.999, sustainBlend = 0.0, ringLimit = 1.0, trScale = 1.0;
     double mix = 0.0, fadeStep = 0.002;
 
     // learning
