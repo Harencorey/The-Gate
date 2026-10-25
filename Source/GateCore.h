@@ -133,7 +133,7 @@ public:
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
         std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
         spectral.reset();
-        specHp1.reset(); specHp2.reset(); specLp1.reset(); specLp2.reset(); specEnv = specValley = specBB = specBBValley = 0.0; specHoldLeft = specBBHold = 0; lastSpecOnset = 0;
+        specHp1.reset(); specHp2.reset(); specLp1.reset(); specLp2.reset(); specBp.reset(); specF0 = 0.0; specArmAt = specArmUntil = 0; specLowRef = 0.0; specEnv = specValley = specBB = specBBValley = 0.0; specHoldLeft = specBBHold = 0; lastSpecOnset = 0;
         writePos = 0;
         clock = 0;
         for (auto* f : { &hpf1, &hpf2, &lpf1, &lpf2 }) f->reset();
@@ -255,25 +255,41 @@ public:
                 else specEnv = ah + (specEnv - ah) * specRel;
                 if (specEnv < specValley) specValley = specEnv;
                 else specValley += (specEnv - specValley) * specRise;
-                // the key's LOW band (< 500 Hz) too: hat or cymbal bleed jumps the high band but barely
-                // moves the lows; a stick hit on the drum lifts its body as well
-                double l1u, l2u;
-                const double lowK = specLp2.tick (specLp1.tick (k, l1u), l2u);
+                // the source's FUNDAMENTAL too (learned by the spectral decay; until then everything
+                // below 500 Hz): cymbals - even layered over a ringing drum - barely move it; a stick hit
+                // on the drum does
+                if ((clock % 4096) == 0)
+                {
+                    const double f0 = spectral.fundamentalHz();
+                    if (f0 > 0.0 && std::abs (f0 - specF0) > 0.5) { specF0 = f0; specBp.setup (f0, sr, 1.5); }
+                }
+                double l1u, l2u, lowK;
+                if (specF0 > 0.0) lowK = specBp.bandPass (k);
+                else lowK = specLp2.tick (specLp1.tick (k, l1u), l2u);
                 const double ab = std::abs (lowK);
                 if (ab >= specBB) { specBB = ab; specBBHold = specLowHoldLen; }   // held over a whole cycle of a 40 Hz drum
                 else if (specBBHold > 0) --specBBHold;
                 else specBB = ab + (specBB - ab) * specRel;
                 if (specBB < specBBValley) specBBValley = specBB;
                 else specBBValley += (specBB - specBBValley) * specRise;
-                if (specEnv > 4.0 * specValley && specBB > 1.122 * specBBValley && specBB >= 0.5 * thrOpen && specEnv > 1e-4 && clock >= lastSpecOnset + minGap)
+                // the crack arms it; the fundamental must then confirm within 12 ms (an 80 Hz rise takes
+                // a few ms to show). The re-open is marked from the crack, so with enough lookahead the
+                // highs are open before the stroke.
+                if (specEnv > 4.0 * specValley && specEnv > 1e-4 && clock >= lastSpecOnset + minGap && clock >= specArmUntil)
                 {
-                    const uint64_t back = (uint64_t) (3 * oneMs);   // the jump is seen a little into the crack: open from before it
-                    const uint64_t at = clock >= back ? clock - back : 0;
+                    specArmAt = clock; specArmUntil = clock + (uint64_t) (12 * oneMs); specLowRef = specBBValley;
+                    specValley = specEnv;
+                }
+                if (clock < specArmUntil && specBB > specLowJump * specLowRef && specBB >= 0.5 * thrOpen)
+                {
+                    const uint64_t back = (uint64_t) (3 * oneMs);
+                    const uint64_t at = specArmAt >= back ? specArmAt - back : 0;
                     const uint64_t outNow2 = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
                     onsetRing[(size_t) (std::max (at, outNow2) & (uint64_t) ringMask)] = 1;
                     lastSpecOnset = clock;
                     ++specOnsets;
-                    specValley = specEnv; specBBValley = specBB;
+                    specArmUntil = 0;
+                    specBBValley = specBB;
                 }
             }
 
@@ -674,12 +690,15 @@ private:
 
     std::vector<float>   audioRing, keyRing, levelRing;
     std::vector<uint8_t> stateRing, onsetRing;
-    Svf specHp1, specHp2, specLp1, specLp2;   // the stick-attack detector's high and low bands
+    Svf specHp1, specHp2, specLp1, specLp2, specBp;   // the stick-attack detector's high band, and its low band / the fundamental
+    double specF0 = 0.0;
     double specEnv = 0.0, specValley = 0.0, specBB = 0.0, specBBValley = 0.0, specRel = 0.999, specRise = 0.001;
     int specHoldLeft = 0, specBBHold = 0, specHoldLen = 96, specLowHoldLen = 1200;
-    uint64_t lastSpecOnset = 0;
+    uint64_t lastSpecOnset = 0, specArmAt = 0, specArmUntil = 0;
+    double specLowRef = 0.0;
 public:
     int specOnsets = 0;   // stick attacks the spectral decay re-opened for (tests)
+    double specLowJump = 1.122;   // how much the low band / fundamental must rise for a stick hit (ratio)
 private:
     size_t ringSize = 1, ringMask = 0, writePos = 0;
     uint64_t clock = 0;

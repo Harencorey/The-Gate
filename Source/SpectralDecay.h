@@ -156,7 +156,7 @@ public:
     {
         for (int c = 0; c < kMaxCh; ++c) { lp[c].reset(); mv1[c].reset(); mv2[c].reset(); }
         hfSplit.reset(); hfSplit2.reset(); holdH = 0;
-        bodyHz = 0.0; pendingBodyHz = -1.0;
+        bodyHz = 0.0; pendingBodyHz = -1.0; fundHz = 0.0;
         haveBody = false;
         std::fill (srcPow.begin(), srcPow.end(), 0.0);
         std::fill (bleedPow.begin(), bleedPow.end(), 0.0);
@@ -267,7 +267,7 @@ public:
             if (rampLeft == 0) { h = 1.0; fc = fcTarget = fTop; }
             retuneIn = 0;
         }
-        else if (phase == tail && focusK > 0.0 && ! untouched)
+        else if (phase == tail && focusK > 0.0 && ! untouched && hits >= kReadyHits)
         {
             if (closeLeft > 0) { --closeLeft; h = (double) closeLeft / closeLen; }   // 3 ms fade into the closed highs
             else h = 0.0;
@@ -275,7 +275,7 @@ public:
             fcTarget = std::max (fcMin(), fTop * std::pow (2.0, focusK * fallenDb));
             fc = fcTarget + (fc - fcTarget) * fcSmooth;
         }
-        else if (focusK <= 0.0) { h = 1.0; fc = fcTarget = fTop; }
+        else if (focusK <= 0.0 || hits < kReadyHits) { h = 1.0; fc = fcTarget = fTop; }   // nothing learned yet: the plain gate
         if (--retuneIn <= 0) { setMoving (fc); retuneIn = 16; }
 
         //---------------- the body: follows the gate; with Sustain it rings on
@@ -317,6 +317,7 @@ public:
     int hitsLearned() const noexcept { return hits; }
     int bleedsLearned() const noexcept { return bleeds; }
     float bodyTopHz() const noexcept { return (float) bodyHz; }          // 0 = no body band
+    double fundamentalHz() const noexcept { return fundHz; }            // 0 = not learned / a high source
     double transientMs() const noexcept { return trCount > 0 ? learnedTrMs : 20.0; }   // learned attack (20 ms until learned)
     double cutoffHz() const noexcept { return fc; }
     double highGain() const noexcept { return h; }
@@ -429,6 +430,7 @@ private:
         double maxDb = -400.0; int maxBin = lo;
         for (int i = lo; i <= hi; ++i) if (dbAt (i) > maxDb) { maxDb = dbAt (i); maxBin = i; }
         double top = 0.0;
+        fundHz = maxBin * binHz < 1000.0 ? maxBin * binHz : 0.0;   // the source's strongest low resonance
         if (maxBin * binHz < 1000.0)
         {
             const double sixth = std::pow (2.0, 1.0 / 6.0);
@@ -485,7 +487,7 @@ private:
     Svf mv1[kMaxCh], mv2[kMaxCh];    // the moving low-pass (4-pole)
     Svf hfSplit, hfSplit2;           // > 1 kHz (4-pole), for learning the attack
     int holdH = 0, hfHold = 96;
-    double bodyHz = 0.0, pendingBodyHz = -1.0;
+    double bodyHz = 0.0, pendingBodyHz = -1.0, fundHz = 0.0;
     bool haveBody = false;
 
     // state
@@ -498,6 +500,7 @@ private:
     double envH = 0.0, peakH = 0.0, preH = 0.0, floorH = -200.0;
     bool measuring = false; int measPos = 0;
     static constexpr int kTrHist = 15;
+    static constexpr int kReadyHits = 3;   // until this many hits are learned, it's exactly the plain gate
     std::array<double, kTrHist> trHist {};
     double learnedTrMs = 0.0; int trCount = 0;
     double bodyEnvRel = 0.999, hfEnvRel = 0.98, floorFall = 0.9996, floorRise = 0.999993, fcSmooth = 0.995;

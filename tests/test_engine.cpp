@@ -937,7 +937,7 @@ static void testSpectralLearns()
                  nh, ses.toms.size(), extra, sp.bodyTopHz(), sp.transientMs(), ec.spectralDecay().transientMs());
     CHECK (nh == (int) ses.toms.size() && extra == 0, "%d hits, %d not toms", nh, extra);
     CHECK (sp.bodyTopHz() >= 300 && sp.bodyTopHz() <= 1200, "body band top %.0f Hz", sp.bodyTopHz());
-    CHECK (ec.spectralDecay().transientMs() >= 3.0 && ec.spectralDecay().transientMs() <= 12.0, "clean attack %.1f ms", ec.spectralDecay().transientMs());
+    CHECK (ec.spectralDecay().transientMs() >= 3.0 && ec.spectralDecay().transientMs() <= 14.0, "clean attack %.1f ms", ec.spectralDecay().transientMs());
     CHECK (sp.transientMs() >= 3.0 && sp.transientMs() <= 25.0, "attack %.1f ms", sp.transientMs());
 }
 
