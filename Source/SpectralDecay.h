@@ -145,6 +145,7 @@ public:
         fcSmooth = std::exp (-1.0 / (0.004 * sr));
         fadeStep = 1.0 / std::max (1.0, 0.010 * sr);
         closeLen = std::max (1, (int) std::lround (0.003 * sr));
+        sameHit = (int) std::lround (0.005 * sr);
         fTop = std::min (20000.0, 0.45 * sr);
         hfSplit.setup (1000.0, sr, 0.5411961); hfSplit2.setup (1000.0, sr, 1.3065630);   // 4-pole: the body doesn't leak in
         reset();
@@ -162,7 +163,7 @@ public:
         hits = bleeds = 0;
         capMode = idle; capPos = 0; capWait = -1;
         closedRun = 0; sinceBleed = bleedEvery;
-        phase = tail; trLeft = 0; closeLeft = 0;
+        phase = tail; trLeft = 0; closeLeft = 0; sinceOnset = 1 << 30;
         rampLeft = rampLen = 0; rampFromH = 1.0; rampFromFc = fTop;
         h = 1.0; fc = fcTarget = fTop; retuneIn = 0;
         envB = peakB = 0.0; floorB = -200.0; own = 0.0; holding = false;
@@ -226,6 +227,13 @@ public:
 
         //---------------- hit timing
         const double trSamples = std::clamp (transientMs() * trScale, 1.0, 100.0) * 0.001 * sr;
+        // two detectors can mark the same hit a sample or two apart: within 5 ms it's one hit
+        if (onsetNow && sinceOnset < sameHit)
+        {
+            onsetNow = false;   // the same hit: keep the attack window running from this later mark
+            if (phase == transient) trLeft = std::max (trLeft, (int) std::lround (trSamples));
+        }
+        if (onsetNow) sinceOnset = 0; else if (sinceOnset < (1 << 30)) ++sinceOnset;
         if (onsetNow)
         {
             if (pendingBodyHz >= 0.0) applyBody();       // a new body band switches in on an attack (gains equal)
@@ -482,6 +490,7 @@ private:
 
     // state
     Phase phase = tail;
+    int sinceOnset = 1 << 30, sameHit = 240;
     int trLeft = 0, closeLeft = 0, closeLen = 144, rampLeft = 0, rampLen = 0, retuneIn = 0;
     double h = 1.0, fc = 20000.0, fcTarget = 20000.0, fTop = 20000.0, rampFromH = 1.0, rampFromFc = 20000.0;
     double envB = 0.0, peakB = 0.0, floorB = -200.0, own = 0.0;

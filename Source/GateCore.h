@@ -116,6 +116,11 @@ public:
         onsetRing.assign (ringSize, 0);
         keyAbsRing.assign (ringSize, 0.0f);
         glow.prepare (sr, numCh);
+        specHp1.setup (1000.0, sr, kButterQ1); specHp2.setup (1000.0, sr, kButterQ2);
+        specLp1.setup (500.0, sr, kButterQ1); specLp2.setup (500.0, sr, kButterQ2);
+        specRel = std::exp (-1.0 / (0.005 * sr)); specRise = 1.0 - std::exp (-1.0 / (0.030 * sr));
+        specHoldLen = (int) std::lround (0.002 * sr);
+        specLowHoldLen = (int) std::lround (0.025 * sr);
         spectral.prepare (sr, numCh);
         reset();
     }
@@ -128,6 +133,7 @@ public:
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
         std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
         spectral.reset();
+        specHp1.reset(); specHp2.reset(); specLp1.reset(); specLp2.reset(); specEnv = specValley = specBB = specBBValley = 0.0; specHoldLeft = specBBHold = 0; lastSpecOnset = 0;
         writePos = 0;
         clock = 0;
         for (auto* f : { &hpf1, &hpf2, &lpf1, &lpf2 }) f->reset();
@@ -235,6 +241,40 @@ public:
             {
                 for (int c = 0; c < numChannels; ++c) k += io[c][i];
                 k /= std::max (1, numChannels);
+            }
+
+            //---------------- stick-attack detector for the spectral decay (independent of the gate's
+            // stroke detection): a sharp jump in the key's high band (> 1 kHz) is a new stick hit, even a
+            // tom hit again while it's still ringing. The spectral decay re-opens its highs before it.
+            {
+                double a1, hk;
+                specHp1.tick (k, a1); specHp2.tick (a1, hk);
+                const double ah = std::abs (hk);
+                if (ah >= specEnv) { specEnv = ah; specHoldLeft = specHoldLen; }
+                else if (specHoldLeft > 0) --specHoldLeft;
+                else specEnv = ah + (specEnv - ah) * specRel;
+                if (specEnv < specValley) specValley = specEnv;
+                else specValley += (specEnv - specValley) * specRise;
+                // the key's LOW band (< 500 Hz) too: hat or cymbal bleed jumps the high band but barely
+                // moves the lows; a stick hit on the drum lifts its body as well
+                double l1u, l2u;
+                const double lowK = specLp2.tick (specLp1.tick (k, l1u), l2u);
+                const double ab = std::abs (lowK);
+                if (ab >= specBB) { specBB = ab; specBBHold = specLowHoldLen; }   // held over a whole cycle of a 40 Hz drum
+                else if (specBBHold > 0) --specBBHold;
+                else specBB = ab + (specBB - ab) * specRel;
+                if (specBB < specBBValley) specBBValley = specBB;
+                else specBBValley += (specBB - specBBValley) * specRise;
+                if (specEnv > 4.0 * specValley && specBB > 1.122 * specBBValley && specBB >= 0.5 * thrOpen && specEnv > 1e-4 && clock >= lastSpecOnset + minGap)
+                {
+                    const uint64_t back = (uint64_t) (3 * oneMs);   // the jump is seen a little into the crack: open from before it
+                    const uint64_t at = clock >= back ? clock - back : 0;
+                    const uint64_t outNow2 = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
+                    onsetRing[(size_t) (std::max (at, outNow2) & (uint64_t) ringMask)] = 1;
+                    lastSpecOnset = clock;
+                    ++specOnsets;
+                    specValley = specEnv; specBBValley = specBB;
+                }
             }
 
             double hp = k, dummy;
@@ -478,13 +518,15 @@ public:
             const bool onsetNow = onsetRing[rAudio] != 0;
             onsetRing[rAudio] = 0;
             const int attackN = (int) attackSamples;
-            const int peek = la > 0 ? std::min (attackN, la) : 0;
+            // the spectral decay re-opens its highs over the 2 ms (or the lookahead, if shorter) BEFORE
+            // a stroke, so the stroke's first sample is already full range: the attack is untouched
+            const int peek = la > 0 ? std::min (std::max (attackN, (int) std::lround (0.002 * sr)), la) : 0;
             const bool onsetAhead = peek > 0 && onsetRing[(rAudio + (size_t) peek) & ringMask] != 0;
             const bool gateClosed = stateRing[rAudio] == 0 && g <= gFloor + 1e-9;
             float gated[kMaxChannels];
             for (int c = 0; c < numChannels; ++c) gated[c] = audioRing[(size_t) c * ringSize + rAudio];
             // x * gate gain when the spectral decay is off (bit-exact), its shaped tail when on
-            spectral.tick (gated, numChannels, gf, (float) gFloor * laFadeGain, onsetNow, onsetAhead, attackN, gateClosed);
+            spectral.tick (gated, numChannels, gf, (float) gFloor * laFadeGain, onsetNow, onsetAhead, peek > 0 ? peek : attackN, gateClosed);
             if (s.listen)
             {
                 const float kOut = keyRing[rAudio] * laFadeGain;
@@ -632,6 +674,13 @@ private:
 
     std::vector<float>   audioRing, keyRing, levelRing;
     std::vector<uint8_t> stateRing, onsetRing;
+    Svf specHp1, specHp2, specLp1, specLp2;   // the stick-attack detector's high and low bands
+    double specEnv = 0.0, specValley = 0.0, specBB = 0.0, specBBValley = 0.0, specRel = 0.999, specRise = 0.001;
+    int specHoldLeft = 0, specBBHold = 0, specHoldLen = 96, specLowHoldLen = 1200;
+    uint64_t lastSpecOnset = 0;
+public:
+    int specOnsets = 0;   // stick attacks the spectral decay re-opened for (tests)
+private:
     size_t ringSize = 1, ringMask = 0, writePos = 0;
     uint64_t clock = 0;
 
