@@ -7,8 +7,8 @@
 //
 //   1. TRANSIENT - from each hit's first sample, for as long as the source's attack lasts,
 //      the output is exactly the plain gate (full bandwidth, untouched). The length is LEARNED:
-//      on every hit the source's high band (> 2 kHz) is followed until its crack has fallen
-//      18 dB (or back to what was there before the hit), median of the last 15 hits, 3..50 ms. The
+//      on every hit the source's attack band (> 1 kHz) is followed until it has fallen 12 dB
+//      under its peak; hits buried in wash are skipped; median of the last 15 hits, 3..50 ms. The
 //      Transient knob scales it (-100 % = half, +100 % = double).
 //   2. THE HIGHS CLOSE FROM THE TOP DOWN - after the transient, a 4-pole low-pass glides down
 //      as the hit's body decays: cutoff = top x 2^(-k x dB the body has fallen since its peak),
@@ -145,7 +145,7 @@ public:
         fadeStep = 1.0 / std::max (1.0, 0.010 * sr);
         closeLen = std::max (1, (int) std::lround (0.003 * sr));
         fTop = std::min (20000.0, 0.45 * sr);
-        hfSplit.setup (2000.0, sr, 0.70710678);
+        hfSplit.setup (1000.0, sr, 0.70710678);
         reset();
     }
 
@@ -305,7 +305,7 @@ public:
     int hitsLearned() const noexcept { return hits; }
     int bleedsLearned() const noexcept { return bleeds; }
     float bodyTopHz() const noexcept { return (float) bodyHz; }          // 0 = no body band
-    double transientMs() const noexcept { return trCount > 0 ? learnedTrMs : 15.0; }   // learned attack (15 ms until learned)
+    double transientMs() const noexcept { return trCount > 0 ? learnedTrMs : 20.0; }   // learned attack (20 ms until learned)
     double cutoffHz() const noexcept { return fc; }
     double highGain() const noexcept { return h; }
     double sourceDbAt (double hz) const noexcept { const size_t i = (size_t) std::lround (hz * fftSize / sr); return 10.0 * std::log10 (std::max (srcPow[std::min (i, srcPow.size() - 1)], 1e-30)); }
@@ -346,12 +346,14 @@ private:
         const double floorLin = floorH < -150.0 ? 0.0 : std::pow (10.0, floorH / 20.0);
         const int minPos = (int) (0.002 * sr), maxPos = (int) (0.050 * sr);
         bool done = false;
-        // over when the crack has fallen 18 dB, or back to what the high band had before the hit
-        if (measPos >= minPos && (envH < peakH * 0.1259 || envH < 1.5 * preH || envH < 2.0 * floorLin)) done = true;
+        // over when the attack band has fallen 12 dB under its peak (or into its bleed floor)
+        if (measPos >= minPos && (envH < peakH * 0.2512 || envH < 2.0 * floorLin)) done = true;
         if (measPos >= maxPos) done = true;
         if (gateClosed) { measuring = false; return; }     // gate shut before the attack ended: not a usable hit
         if (! done) return;
         measuring = false;
+        if (peakH < 2.5 * preH) return;   // the hit barely rose out of what was already ringing (wash): can't tell
+        if (measPos >= maxPos) return;    // never settled (a crash on it): not the drum's attack
         // the median of the last 15 hits: a hit with a crash on it (the high band never settles)
         // is an outlier, not the drum's attack
         trHist[(size_t) (trCount % kTrHist)] = std::clamp (measPos * 1000.0 / sr, 3.0, 50.0);
