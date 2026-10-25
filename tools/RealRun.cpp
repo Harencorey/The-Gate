@@ -41,6 +41,7 @@ int main (int argc, char** argv)
         else if (k == "sustain") s.spectral.sustain = v;
         else if (k == "transient") s.spectral.transient = v;
         else if (k == "lev")     s.levelerOn = v > 0.5f;
+        else if (k == "src")     s.sourceKey = v > 0.5f;
         else { std::fprintf (stderr, "unknown setting %s\n", k.c_str()); return 1; }
     }
     FILE* f = std::fopen (argv[1], "rb");
@@ -78,7 +79,7 @@ int main (int argc, char** argv)
     FILE* of = std::fopen (argv[2], "wb");
     std::fwrite (y.data() + L, sizeof (float), (size_t) n, of);
     std::fclose (of);
-    std::fprintf (stderr, "latency %d samples, %ld samples processed\n", L, n);
+    std::fprintf (stderr, "latency %d samples, %ld samples processed, source key at %.1f Hz\n", L, n, eng->sourceKeyHz());
     auto& sd = eng->spectralDecay();
     std::fprintf (stderr, "spectral: %d hits learned, %d bleed captures, body band to %.0f Hz, attack %.1f ms\n", sd.hitsLearned(), sd.bleedsLearned(), sd.bodyTopHz(), sd.transientMs());
     if (s.spectral.on)

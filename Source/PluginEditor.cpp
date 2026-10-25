@@ -377,7 +377,7 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     makeKnob (keyHighCut, tg::pid::keyHighCut, "HIGH CUT",   "Low-pass on the key only (24 dB/oct): keeps cymbals from opening the gate. Top = Off.");
     makeKnob (tracking,   tg::pid::tracking,   "TRACKING",   "The high cut follows each hit: open on the strike to catch the attack, then closing as the hit decays, so cymbal bleed in the tail can't hold the gate open. 100 % = one octave per 12 dB of decay.");
     makeChoice (lookahead, tg::pid::lookahead, "LOOKAHEAD", "How far ahead the gate looks. More = cleaner openings, more latency (reported to the host). Use Off or 2 ms for live playing.");
-    makeChoice (keySource, tg::pid::keySource, "KEY",       "What the gate listens to: its own input, or the sidechain input.");
+    makeChoice (keySource, tg::pid::keySource, "KEY",       "What the gate listens to: its own input, the sidechain input, or Source: its own input at the drum's learned fundamental, opening only on a stick attack - so cymbals and a drum ringing in sympathy can't open it.");
 
     makeKnob (levelAmount, tg::pid::levelAmount, "AMOUNT", "How much of the gap to the target each hit closes. 100 % = every hit lands on the target; 50 % = halfway.");
     makeKnob (levelTarget, tg::pid::levelTarget, "TARGET", "The peak level hits are evened towards. Bottom = Auto: the running average of the last few hits, so the overall level stays put and only the hit-to-hit differences shrink.");
@@ -450,10 +450,10 @@ void TheGateEditor::timerCallback()
     const float lvl = levelerOn.getToggleState() ? 1.0f : 0.4f, glw = glowOn.getToggleState() ? 1.0f : 0.4f;
     for (auto* k : { &levelAmount, &levelTarget, &levelMax }) { k->slider.setAlpha (lvl); k->label.setAlpha (lvl); }
     glowDrive.setAlpha (glw);
-    const float spc = specOn.getToggleState() ? 1.0f : 0.4f;
+    const float spc = 0.0f;   // parked
     for (auto* k : { &specTransient, &specFocus, &specSustain }) { k->slider.setAlpha (spc); k->label.setAlpha (spc); }
     spectrum.setAlpha (spc);
-    spectrum.pull();
+    repaint (sourceNote);
     glowType.box.setAlpha (glw); glowType.label.setAlpha (glw);
     glowDrive.setModulated (proc.engine.glowModulatedDrive());
 }
@@ -479,13 +479,28 @@ void TheGateEditor::paint (Graphics& g)
         g.drawText (title, area.withHeight (18).reduced (10, 0), Justification::centredLeft);
     }
 
-    const bool wantsSc = proc.apvts.getRawParameterValue (tg::pid::keySource)->load() > 0.5f;
+    const int keyMode = (int) std::lround (proc.apvts.getRawParameterValue (tg::pid::keySource)->load());
+    const bool wantsSc = keyMode == 1;
     if (wantsSc && ! proc.sidechainConnected())
     {
         g.setColour (colours::accent);
         g.setFont (FontOptions (11.0f));
         g.drawText ("No sidechain input: route one to the plug-in's sidechain in your DAW", getLocalBounds().removeFromTop (40).reduced (160, 0), Justification::centred);
     }
+    if (keyMode == 2)
+    {
+        // the Source key's learned fundamental, under the Key menu
+        const double f0 = proc.engine.sourceKeyHz();
+        g.setColour (colours::level);
+        g.setFont (FontOptions (11.0f));
+        g.drawText (f0 > 0.0 ? "listening at " + String (roundToInt (f0)) + " Hz + stick attack" : "learning the drum... (stick attack only)",
+                    sourceNote, Justification::centred);
+    }
+    // spectral decay is parked until the instance network (it needs to know what else was hit)
+    g.setColour (colours::dim);
+    g.setFont (FontOptions (12.0f));
+    g.drawFittedText ("Parked for now: comes back once the instances can tell each other\nwhat was hit (Phase 6). The gate decides everything; this will only ever take bleed away.",
+                      specArea.reduced (16, 30), Justification::centred, 3);
 }
 
 void TheGateEditor::resized()
@@ -539,6 +554,7 @@ void TheGateEditor::resized()
         auto left = bottom.removeFromLeft (bottom.getWidth() / 2);
         keySource.label.setBounds (left.removeFromTop (14));
         keySource.box.setBounds (left.removeFromTop (24).reduced (10, 0));
+        sourceNote = left.removeFromTop (16).expanded (60, 0).translated (30, 2);
         bottom.removeFromTop (14);
         listen.setBounds (bottom.removeFromTop (24).reduced (10, 0));
     }
@@ -557,6 +573,9 @@ void TheGateEditor::resized()
         placeKnob (specTransient, cols[0]); placeKnob (specFocus, cols[1]); placeKnob (specSustain, cols[2]);
         spectrum.setBounds (a.withTrimmedLeft (4).withTrimmedBottom (4));
     }
+    for (Component* c : { (Component*) &specOn, (Component*) &spectrum, (Component*) &specTransient.slider, (Component*) &specTransient.label,
+                          (Component*) &specFocus.slider, (Component*) &specFocus.label, (Component*) &specSustain.slider, (Component*) &specSustain.label })
+        c->setVisible (false);   // parked
     glowOn.setBounds (glowArea.getRight() - 54, glowArea.getY() + 6, 44, 20);
     {
         auto a = levelArea.reduced (8).withTrimmedTop (22);

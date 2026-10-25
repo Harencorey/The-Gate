@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gatedata as gd
 
 BIN, LABELS, SESS, DATA, OUT = sys.argv[1:6]
-WORK = "/home/claude/rr/work"; os.makedirs(WORK, exist_ok=True)
+EXTRA = sys.argv[6:]   # extra engine settings for every run (e.g. src=1)
+WORK = "/home/claude/rr/work" + ("_" + "_".join(a.replace("=", "") for a in sys.argv[6:]) if len(sys.argv) > 6 else ""); os.makedirs(WORK, exist_ok=True)
 MIC = {"snare": "snare_top", "rack1": "rack1", "rack2": "rack2", "floor1": "floor1", "floor2": "floor2"}
 BASE = ["hold=30", "rel=250", "la=5", "hpf=50", "range=-80"]
 THRS = list(range(-42, -5, 3))
@@ -33,7 +34,7 @@ def gain_db(x, y):
 
 def run(inp, tag, args):
     out = f"{WORK}/{tag}.out.f32"
-    subprocess.run([BIN, inp, out, f"{WORK}/{tag}.csv", str(SR)] + BASE + args, check=True, capture_output=True)
+    subprocess.run([BIN, inp, out, f"{WORK}/{tag}.csv", str(SR)] + BASE + EXTRA + args, check=True, capture_output=True)
     y = np.fromfile(out, np.float32); os.remove(out); os.remove(f"{WORK}/{tag}.csv")
     return y
 

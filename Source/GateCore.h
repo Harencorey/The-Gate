@@ -59,6 +59,7 @@ struct GateSettings
     float keyHighCutHz = 0.0f;     // 0 = off
     float trackingPct  = 0.0f;     // 0..100: how far the high cut closes as each hit decays
     bool  externalKey  = false;    // key from the sidechain input
+    bool  sourceKey    = false;    // Source key: the level at the drum's learned fundamental, opening only on a stick attack
     bool  listen       = false;    // output the filtered key (what the detector hears)
 
     // Leveler
@@ -116,6 +117,9 @@ public:
         onsetRing.assign (ringSize, 0);
         keyAbsRing.assign (ringSize, 0.0f);
         glow.prepare (sr, numCh);
+        atkHp1.setup (1000.0, sr, kButterQ1); atkHp2.setup (1000.0, sr, kButterQ2);
+        atkRel = std::exp (-1.0 / (0.005 * sr)); atkRise = 1.0 - std::exp (-1.0 / (0.030 * sr));
+        atkHoldLen = (int) std::lround (0.002 * sr); attackWindow = (int) std::lround (0.010 * sr);
         spectral.prepare (sr, numCh);
         reset();
     }
@@ -128,6 +132,7 @@ public:
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
         std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
         spectral.reset();
+        atkHp1.reset(); atkHp2.reset(); srcBp1.reset(); srcBp2.reset(); atkEnv = atkValley = srcPeak = srcRms = 0.0; atkHoldLeft = 0; haveAttack = false; lastAttack = 0; srcF0 = 0.0;
         writePos = 0;
         clock = 0;
         for (auto* f : { &hpf1, &hpf2, &lpf1, &lpf2 }) f->reset();
@@ -257,6 +262,32 @@ public:
                     trackPeak = std::max (trackPeak, trackFast);
             }
 
+            //---------------- Source key: the drum's fundamental, confirmed by a stick attack
+            // Cymbals and hats put next to nothing at a tom's fundamental, so they can't push it over the
+            // threshold; a drum ringing in sympathy (a floor tom off the kick) does reach it, but has no
+            // stick crack - so the gate only OPENS when the fundamental crosses the threshold within
+            // 10 ms of a stick attack (the key's high band jumping 12 dB). Closing follows the
+            // fundamental alone. Until the fundamental is learned it uses the normal key level, with
+            // the same stick-attack check.
+            double srcBand = 0.0;
+            {
+                double a1, hk;
+                atkHp1.tick (k, a1); atkHp2.tick (a1, hk);
+                const double ah = std::abs (hk);
+                if (ah >= atkEnv) { atkEnv = ah; atkHoldLeft = atkHoldLen; }
+                else if (atkHoldLeft > 0) --atkHoldLeft;
+                else atkEnv = ah + (atkEnv - ah) * atkRel;
+                if (atkEnv < atkValley) atkValley = atkEnv;
+                else atkValley += (atkEnv - atkValley) * atkRise;
+                if (atkEnv > 4.0 * atkValley && atkEnv > 1e-5) { lastAttack = clock; haveAttack = true; atkValley = atkEnv; }
+                if ((clock % 4096) == 0)
+                {
+                    const double f0 = spectral.fundamentalHz();
+                    if (f0 > 0.0 && std::abs (f0 - srcF0) > 0.5) { srcF0 = f0; srcBp1.setup (f0, sr, 2.0); srcBp2.setup (f0, sr, 2.0); }
+                }
+                if (srcF0 > 0.0) srcBand = srcBp2.bandPass (srcBp1.bandPass (hp));
+            }
+
             double kf = hp;
             if (lpfOn)
             {
@@ -268,10 +299,18 @@ public:
             const double a = std::abs (kf);
             peakEnv = a > peakEnv ? a : a + (peakEnv - a) * peakRel;
             rmsPow  = kf * kf + (rmsPow - kf * kf) * rmsCoef;
-            const double level = 0.5 * (peakEnv + 1.41421356 * std::sqrt (rmsPow));
+            double level = 0.5 * (peakEnv + 1.41421356 * std::sqrt (rmsPow));
+            if (s.sourceKey && srcF0 > 0.0)
+            {
+                const double sa = std::abs (srcBand);
+                srcPeak = sa > srcPeak ? sa : sa + (srcPeak - sa) * peakRel;
+                srcRms  = srcBand * srcBand + (srcRms - srcBand * srcBand) * rmsCoef;
+                level = 0.5 * (srcPeak + 1.41421356 * std::sqrt (srcRms));
+            }
+            const bool attackRecent = haveAttack && clock - lastAttack <= (uint64_t) attackWindow;
 
             const bool wasOpen = detectorOpen;
-            if (! detectorOpen && level >= thrOpen)       detectorOpen = true;
+            if (! detectorOpen && level >= thrOpen && (! s.sourceKey || attackRecent)) detectorOpen = true;
             else if (detectorOpen && level < thrClose)    detectorOpen = false;
 
             //---------------- onsets: the gate opening, or a fresh stroke while it's open
@@ -632,6 +671,14 @@ private:
 
     std::vector<float>   audioRing, keyRing, levelRing;
     std::vector<uint8_t> stateRing, onsetRing;
+    // Source key
+    Svf atkHp1, atkHp2, srcBp1, srcBp2;
+    double atkEnv = 0.0, atkValley = 0.0, atkRel = 0.999, atkRise = 0.001, srcPeak = 0.0, srcRms = 0.0, srcF0 = 0.0;
+    int atkHoldLeft = 0, atkHoldLen = 96, attackWindow = 480;
+    uint64_t lastAttack = 0; bool haveAttack = false;
+public:
+    double sourceKeyHz() const noexcept { return srcF0; }   // the Source key's fundamental (0 = not learned yet)
+private:
     size_t ringSize = 1, ringMask = 0, writePos = 0;
     uint64_t clock = 0;
 

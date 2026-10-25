@@ -40,7 +40,7 @@ AudioProcessorValueTreeState::ParameterLayout TheGateProcessor::createLayout()
     ps.push_back (std::make_unique<AudioParameterChoice> (ParameterID { tg::pid::lookahead, 1 }, "Lookahead",
                                        StringArray { "Off", "2 ms", "5 ms", "10 ms", "20 ms" }, tg::kLookaheadDefault));
     ps.push_back (std::make_unique<AudioParameterChoice> (ParameterID { tg::pid::keySource, 1 }, "Key",
-                                       StringArray { "Internal", "Sidechain" }, 0));
+                                       StringArray { "Internal", "Sidechain", "Source" }, 0));
     ps.push_back (std::make_unique<P> (ParameterID { tg::pid::keyHpf, 1 },     "Key HPF",      skewed (tg::kHpfOffHz, 2000.0f, 150.0f), tg::kHpfOffHz, hz (tg::kHpfOffHz, true)));
     ps.push_back (std::make_unique<P> (ParameterID { tg::pid::keyHighCut, 1 }, "Key High Cut", skewed (1000.0f, tg::kHighCutOffHz, 6000.0f), tg::kHighCutOffHz, hz (tg::kHighCutOffHz, false)));
     ps.push_back (std::make_unique<P> (ParameterID { tg::pid::tracking, 1 },   "Tracking",     NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f,
@@ -139,7 +139,9 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.releaseMs    = raw.release->load();
     s.rangeDb      = raw.range->load();
     s.lookaheadMs  = tg::kLookaheadMs[jlimit (0, 4, (int) raw.lookahead->load())];
-    s.externalKey  = raw.keySource->load() > 0.5f;
+    const int keyMode = (int) std::lround (raw.keySource->load());
+    s.externalKey  = keyMode == 1;
+    s.sourceKey    = keyMode == 2;
     const float hpf = raw.keyHpf->load(), hc = raw.keyHighCut->load();
     s.keyHpfHz     = hpf <= tg::kHpfOffHz ? 0.0f : hpf;
     s.keyHighCutHz = hc >= tg::kHighCutOffHz ? 0.0f : hc;
@@ -154,7 +156,7 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.glow.type      = jlimit (0, 1, (int) raw.glowType->load());
     s.glow.drive     = raw.glowDrive->load();
     s.glow.envAmount = raw.glowEnv->load();
-    s.spectral.on      = raw.specOn->load() > 0.5f;
+    s.spectral.on      = false;   // parked until the instance network (see ROADMAP): never on in a build
     s.spectral.focus   = raw.specFocus->load();
     s.spectral.sustain = raw.specSustain->load();
     s.spectral.transient = raw.specTransient->load();

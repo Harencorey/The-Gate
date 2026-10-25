@@ -155,7 +155,7 @@ public:
     {
         for (int c = 0; c < kMaxCh; ++c) { lp[c].reset(); mv1[c].reset(); mv2[c].reset(); }
         hfSplit.reset(); hfSplit2.reset(); holdH = 0;
-        bodyHz = 0.0; pendingBodyHz = -1.0;
+        bodyHz = 0.0; pendingBodyHz = -1.0; fundHz = 0.0;
         haveBody = false;
         std::fill (srcPow.begin(), srcPow.end(), 0.0);
         std::fill (bleedPow.begin(), bleedPow.end(), 0.0);
@@ -309,6 +309,7 @@ public:
     int hitsLearned() const noexcept { return hits; }
     int bleedsLearned() const noexcept { return bleeds; }
     float bodyTopHz() const noexcept { return (float) bodyHz; }          // 0 = no body band
+    double fundamentalHz() const noexcept { return fundHz; }            // 0 = not learned / a high source
     double transientMs() const noexcept { return trCount > 0 ? learnedTrMs : 20.0; }   // learned attack (20 ms until learned)
     double cutoffHz() const noexcept { return fc; }
     double highGain() const noexcept { return h; }
@@ -421,6 +422,7 @@ private:
         double maxDb = -400.0; int maxBin = lo;
         for (int i = lo; i <= hi; ++i) if (dbAt (i) > maxDb) { maxDb = dbAt (i); maxBin = i; }
         double top = 0.0;
+        fundHz = maxBin * binHz < 1000.0 ? maxBin * binHz : 0.0;   // the source's strongest low resonance
         if (maxBin * binHz < 1000.0)
         {
             const double sixth = std::pow (2.0, 1.0 / 6.0);
@@ -477,7 +479,7 @@ private:
     Svf mv1[kMaxCh], mv2[kMaxCh];    // the moving low-pass (4-pole)
     Svf hfSplit, hfSplit2;           // > 1 kHz (4-pole), for learning the attack
     int holdH = 0, hfHold = 96;
-    double bodyHz = 0.0, pendingBodyHz = -1.0;
+    double bodyHz = 0.0, pendingBodyHz = -1.0, fundHz = 0.0;
     bool haveBody = false;
 
     // state
