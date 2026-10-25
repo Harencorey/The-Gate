@@ -138,14 +138,15 @@ public:
         bleedSettle = (int) std::lround (0.020 * sr);
         bleedEvery = (int) std::lround (0.250 * sr);
         bodyEnvRel = std::exp (-1.0 / (0.030 * sr));     // smooth enough for a 40 Hz body
-        hfEnvRel = std::exp (-1.0 / (0.001 * sr));
+        hfEnvRel = std::exp (-1.0 / (0.005 * sr));
+        hfHold = (int) std::lround (0.002 * sr);
         floorFall = std::exp (-1.0 / (0.050 * sr));
         floorRise = std::exp (-1.0 / (3.0 * sr));
         fcSmooth = std::exp (-1.0 / (0.004 * sr));
         fadeStep = 1.0 / std::max (1.0, 0.010 * sr);
         closeLen = std::max (1, (int) std::lround (0.003 * sr));
         fTop = std::min (20000.0, 0.45 * sr);
-        hfSplit.setup (1000.0, sr, 0.70710678);
+        hfSplit.setup (1000.0, sr, 0.5411961); hfSplit2.setup (1000.0, sr, 1.3065630);   // 4-pole: the body doesn't leak in
         reset();
     }
 
@@ -153,7 +154,7 @@ public:
     void reset()
     {
         for (int c = 0; c < kMaxCh; ++c) { lp[c].reset(); mv1[c].reset(); mv2[c].reset(); }
-        hfSplit.reset();
+        hfSplit.reset(); hfSplit2.reset(); holdH = 0;
         bodyHz = 0.0; pendingBodyHz = -1.0;
         haveBody = false;
         std::fill (srcPow.begin(), srcPow.end(), 0.0);
@@ -207,12 +208,15 @@ public:
             mono += x[c];
         }
         mono /= channels;
-        double hfOut; hfSplit.tick (mono, hfOut);
+        double hfA, hfOut; hfSplit.tick (mono, hfA); hfSplit2.tick (hfA, hfOut);
 
         // body envelope (drives the moving cutoff and the Sustain ring) and its bleed floor
         envB = bAbs > envB ? bAbs : bAbs + (envB - bAbs) * bodyEnvRel;
+        // peak with a 2 ms hold, then a 5 ms release: follows the attack's level, not its waveform
         const double aH = std::abs (hfOut);
-        envH = aH > envH ? aH : aH + (envH - aH) * hfEnvRel;
+        if (aH >= envH) { envH = aH; holdH = hfHold; }
+        else if (holdH > 0) --holdH;
+        else envH = aH + (envH - aH) * hfEnvRel;
         if (gateClosed)
         {
             // minimum tracking: a source tail still ringing when the gate shuts isn't bleed
@@ -471,7 +475,8 @@ private:
     // filters
     Svf lp[kMaxCh];                  // the body band
     Svf mv1[kMaxCh], mv2[kMaxCh];    // the moving low-pass (4-pole)
-    Svf hfSplit;                     // > 2 kHz, for learning the attack
+    Svf hfSplit, hfSplit2;           // > 1 kHz (4-pole), for learning the attack
+    int holdH = 0, hfHold = 96;
     double bodyHz = 0.0, pendingBodyHz = -1.0;
     bool haveBody = false;
 

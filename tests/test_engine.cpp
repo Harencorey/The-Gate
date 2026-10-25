@@ -919,11 +919,11 @@ static void testSpectralLearns()
     Buf clean = makeBuf (1, ses.tomOnly.size()); clean[0] = ses.tomOnly;
     tg::GateEngine ec; run (clean, s, sr, 0, nullptr, 3, &ec);
     std::printf ("  %d hits for %zu toms (%d not a tom); body band up to %.0f Hz (the tom's modes: 110-321 Hz)\n"
-                 "  attack: %.1f ms with the hats and crashes on top (hits buried in wash are skipped), %.1f ms on the clean toms (the click: ~3 ms)\n",
+                 "  attack: %.1f ms with the hats and crashes on top (hits buried in wash are skipped), %.1f ms on the clean toms (the click: ~3 ms, + the detector's 2 ms hold)\n",
                  nh, ses.toms.size(), extra, sp.bodyTopHz(), sp.transientMs(), ec.spectralDecay().transientMs());
     CHECK (nh == (int) ses.toms.size() && extra == 0, "%d hits, %d not toms", nh, extra);
     CHECK (sp.bodyTopHz() >= 300 && sp.bodyTopHz() <= 1200, "body band top %.0f Hz", sp.bodyTopHz());
-    CHECK (ec.spectralDecay().transientMs() >= 3.0 && ec.spectralDecay().transientMs() <= 8.0, "clean attack %.1f ms", ec.spectralDecay().transientMs());
+    CHECK (ec.spectralDecay().transientMs() >= 3.0 && ec.spectralDecay().transientMs() <= 12.0, "clean attack %.1f ms", ec.spectralDecay().transientMs());
     CHECK (sp.transientMs() >= 3.0 && sp.transientMs() <= 25.0, "attack %.1f ms", sp.transientMs());
 }
 
