@@ -31,7 +31,13 @@ It ships in stages so every release is something usable in a real session.
   - Leveler gain is set from the peak seen during the lookahead and glides in *before* the hit; 5 ms+ lookahead recommended (sees 3.5 ms of each hit).
   - Micro Glow runs at ~384 kHz like Glow, linear-phase, no DC blocker (zero phase shift), types Tube / Diode / Clip. Its filters add a constant 1 ms of latency, always there so switching it never shifts timing.
 - **Phase 2 update** (Oct 23): Micro Glow is one Drive knob with Glow's envelope follower as a ring around it (concentric pot) and a Tube/Iron dropdown; loudness-matched like Glow's Auto Gain. Clip, Diode and Ceiling removed.
-- **Phase 3: built** on branch `phase-3` (Oct 23), waiting on Corey's ears before merging. Decisions made while building:
+- **Phase 3: reworked** (Oct 25) after Corey's listen on real drums (thin; too much high-end ring; transient definition lost). New design:
+  - **Transient:** each hit stays exactly the plain gate for the source's learned attack length (the >1 kHz band falling 12 dB from its peak; median of recent hits; 12-26 ms on Corey's toms, 27-31 ms snare). Transient knob: half to double.
+  - **Focus:** then a 4-pole low-pass glides down from the top as the hit's body decays (up to 1 octave per dB); the highs close first, the drum's tone fades like it does on its own.
+  - **Sustain:** only the learned body band (fundamental up to ~360-1200 Hz) rings on; the highs never outlast the gate. Per-partial band-passes removed.
+  - Measured on Corey's 7 songs vs the plain gate (30-300 ms after each hit, Focus 60): body below 500 Hz within 0.2 dB, 500 Hz-2 kHz within 0.7 dB, wash (4-12 kHz) -1.3 to -4.7 dB on toms, -3.1 dB snare. Bit-identical to the plain gate when the gains are equal.
+  - Review loop: before/after clips of real fills rendered for listening before each build.
+- Phase 3 first version (Oct 23), superseded; decisions that still stand:
   - Fixed narrow bands were tested and rejected: with zero latency and no phase shift they're too leaky. Instead the tail **learns the source's partials** (resonant filters locked to them) and **the bleed** (while the gate is shut); everything that isn't a partial closes faster (Focus), the partials can ring past the gate (Sustain). Bit-identical to the plain gate when the gains are equal.
   - Stroke detection hardened against bleed: a stroke needs a sharp edge that lifts the peak 4 dB over the tail, or a 6 dB jump in the smooth level (works under cymbal wash); the gate wobbling back open on a decaying note isn't a hit. A ghost note < ~4 dB over a ringing hit merges with it (Phases 4/6 resolve those).
   - Bleed floors use minimum tracking, so a source tail heard while the gate is shut isn't learned as bleed.

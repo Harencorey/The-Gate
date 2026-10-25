@@ -39,6 +39,7 @@ int main (int argc, char** argv)
         else if (k == "spec")    s.spectral.on = v > 0.5f;
         else if (k == "focus")   s.spectral.focus = v;
         else if (k == "sustain") s.spectral.sustain = v;
+        else if (k == "transient") s.spectral.transient = v;
         else if (k == "lev")     s.levelerOn = v > 0.5f;
         else { std::fprintf (stderr, "unknown setting %s\n", k.c_str()); return 1; }
     }
@@ -79,9 +80,7 @@ int main (int argc, char** argv)
     std::fclose (of);
     std::fprintf (stderr, "latency %d samples, %ld samples processed\n", L, n);
     auto& sd = eng->spectralDecay();
-    std::fprintf (stderr, "spectral: %d hits learned, %d bleed captures, %d partials:", sd.hitsLearned(), sd.bleedsLearned(), sd.numLearnedPartials());
-    for (int k = 0; k < sd.numLearnedPartials(); ++k) std::fprintf (stderr, " %.1f", sd.partialHz (k));
-    std::fprintf (stderr, "\n");
+    std::fprintf (stderr, "spectral: %d hits learned, %d bleed captures, body band to %.0f Hz, attack %.1f ms\n", sd.hitsLearned(), sd.bleedsLearned(), sd.bodyTopHz(), sd.transientMs());
     if (s.spectral.on)
     {
         std::fprintf (stderr, "spectrum (Hz: source dB / bleed dB):");
