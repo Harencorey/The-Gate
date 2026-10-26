@@ -42,6 +42,7 @@ int main (int argc, char** argv)
         else if (k == "transient") s.spectral.transient = v;
         else if (k == "lev")     s.levelerOn = v > 0.5f;
         else if (k == "src")     s.sourceKey = v > 0.5f;
+        else if (k == "srcatk")  s.sourceAttackDb = v;
         else { std::fprintf (stderr, "unknown setting %s\n", k.c_str()); return 1; }
     }
     FILE* f = std::fopen (argv[1], "rb");

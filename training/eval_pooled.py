@@ -18,6 +18,7 @@ BIN, LABELS, SESS, DATA, OUT = sys.argv[1:6]
 EXTRA = sys.argv[6:]   # extra engine settings for every run (e.g. src=1)
 WORK = "/home/claude/rr/work" + ("_" + "_".join(a.replace("=", "") for a in sys.argv[6:]) if len(sys.argv) > 6 else ""); os.makedirs(WORK, exist_ok=True)
 MIC = {"snare": "snare_top", "rack1": "rack1", "rack2": "rack2", "floor1": "floor1", "floor2": "floor2"}
+if os.environ.get("DRUMS"): MIC = {d: m for d, m in MIC.items() if d in os.environ["DRUMS"].split(",")}
 BASE = ["hold=30", "rel=250", "la=5", "hpf=50", "range=-80"]
 THRS = list(range(-42, -5, 3))
 SR = 48000

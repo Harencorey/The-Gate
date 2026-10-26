@@ -60,6 +60,7 @@ struct GateSettings
     float trackingPct  = 0.0f;     // 0..100: how far the high cut closes as each hit decays
     bool  externalKey  = false;    // key from the sidechain input
     bool  sourceKey    = false;    // Source key: the level at the drum's learned fundamental, opening only on a stick attack
+    float sourceAttackDb = 12.0f;  // Source key: how far the high band must jump for a stick attack (0 = no check)
     bool  listen       = false;    // output the filtered key (what the detector hears)
 
     // Leveler
@@ -176,6 +177,7 @@ public:
     {
         s = ns;
         thrOpen  = dbToGain (s.thresholdDb);
+        atkJump  = dbToGain (std::max (1.0f, s.sourceAttackDb));
         thrClose = dbToGain (s.thresholdDb - std::max (0.0f, s.hysteresisDb));
         attackSamples = std::max (1.0, std::ceil (s.attackMs * 0.001 * sr - 1e-9));   // whole samples, so the ramp ends exactly on the transient
         holdSamples   = (int) std::lround (std::max (0.0f, s.holdMs) * 0.001 * sr);
@@ -279,7 +281,7 @@ public:
                 else atkEnv = ah + (atkEnv - ah) * atkRel;
                 if (atkEnv < atkValley) atkValley = atkEnv;
                 else atkValley += (atkEnv - atkValley) * atkRise;
-                if (atkEnv > 4.0 * atkValley && atkEnv > 1e-5) { lastAttack = clock; haveAttack = true; atkValley = atkEnv; }
+                if (atkEnv > atkJump * atkValley && atkEnv > 1e-5) { lastAttack = clock; haveAttack = true; atkValley = atkEnv; }
                 if ((clock % 4096) == 0)
                 {
                     const double f0 = spectral.fundamentalHz();
@@ -310,7 +312,7 @@ public:
             const bool attackRecent = haveAttack && clock - lastAttack <= (uint64_t) attackWindow;
 
             const bool wasOpen = detectorOpen;
-            if (! detectorOpen && level >= thrOpen && (! s.sourceKey || attackRecent)) detectorOpen = true;
+            if (! detectorOpen && level >= thrOpen && (! s.sourceKey || s.sourceAttackDb <= 0.0f || attackRecent)) detectorOpen = true;
             else if (detectorOpen && level < thrClose)    detectorOpen = false;
 
             //---------------- onsets: the gate opening, or a fresh stroke while it's open
@@ -673,7 +675,7 @@ private:
     std::vector<uint8_t> stateRing, onsetRing;
     // Source key
     Svf atkHp1, atkHp2, srcBp1, srcBp2;
-    double atkEnv = 0.0, atkValley = 0.0, atkRel = 0.999, atkRise = 0.001, srcPeak = 0.0, srcRms = 0.0, srcF0 = 0.0;
+    double atkJump = 4.0, atkEnv = 0.0, atkValley = 0.0, atkRel = 0.999, atkRise = 0.001, srcPeak = 0.0, srcRms = 0.0, srcF0 = 0.0;
     int atkHoldLeft = 0, atkHoldLen = 96, attackWindow = 480;
     uint64_t lastAttack = 0; bool haveAttack = false;
 public:
