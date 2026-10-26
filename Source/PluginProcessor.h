@@ -50,6 +50,8 @@ private:
     void timerCallback() override;   // keeps the reported latency in step with the Lookahead choice
     tg::GateSettings readSettings() const noexcept;
     int latencyForCurrentChoice() const noexcept;
+    float effectiveLookaheadMs() const noexcept;
+    static constexpr float kSourceMinLookaheadMs = 15.0f;
 
     struct Raw
     {

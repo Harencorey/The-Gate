@@ -174,6 +174,23 @@ static void testPhase2Params()
     CHECK (t->getCurrentValueAsText() == "Auto", "Target bottom shows '%s'", t->getCurrentValueAsText().toRawUTF8());
 }
 
+static void testSourceKeyLatency()
+{
+    std::printf ("Key = Source: the lookahead (and the reported latency) is at least 15 ms\n");
+    TheGateProcessor p;
+    setLayout (p, AudioChannelSet::mono(), AudioChannelSet::disabled());
+    setParam (p, tg::pid::lookahead, 1.0f);   // a short lookahead chosen
+    p.prepareToPlay (48000, 256);
+    const int before = p.getLatencySamples();
+    setParam (p, tg::pid::keySource, 2.0f);
+    AudioBuffer<float> buf (1, 256); buf.clear(); MidiBuffer midi;
+    for (int i = 0; i < 40; ++i) p.processBlock (buf, midi);
+    p.prepareToPlay (48000, 256);
+    const int after = p.getLatencySamples();
+    std::printf ("  latency %d samples with the plain key, %d with the Source key\n", before, after);
+    CHECK (after >= 720 + 48 && after > before, "Source key latency %d (plain %d)", after, before);
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);   // so a crash still shows which test was running
@@ -183,6 +200,7 @@ int main()
     testBypassLatency();
     testStateRoundTrip();
     testPhase2Params();
+    testSourceKeyLatency();
     std::printf ("\n%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }

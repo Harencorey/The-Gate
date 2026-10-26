@@ -138,7 +138,7 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.holdMs       = raw.hold->load();
     s.releaseMs    = raw.release->load();
     s.rangeDb      = raw.range->load();
-    s.lookaheadMs  = tg::kLookaheadMs[jlimit (0, 4, (int) raw.lookahead->load())];
+    s.lookaheadMs  = effectiveLookaheadMs();
     const int keyMode = (int) std::lround (raw.keySource->load());
     s.externalKey  = keyMode == 1;
     s.sourceKey    = keyMode == 2;
@@ -163,9 +163,18 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     return s;
 }
 
+// The Source key opens from where each hit began, which needs the lookahead to still hold it (a low
+// fundamental takes 5-8 ms to build up): in Source mode the lookahead is at least 15 ms.
+float TheGateProcessor::effectiveLookaheadMs() const noexcept
+{
+    const float chosen = tg::kLookaheadMs[jlimit (0, 4, (int) raw.lookahead->load())];
+    const bool source = (int) std::lround (raw.keySource->load()) == 2;
+    return source ? jmax (chosen, kSourceMinLookaheadMs) : chosen;
+}
+
 int TheGateProcessor::latencyForCurrentChoice() const noexcept
 {
-    return engine.latencyFor (tg::kLookaheadMs[jlimit (0, 4, (int) raw.lookahead->load())]);
+    return engine.latencyFor (effectiveLookaheadMs());
 }
 
 void TheGateProcessor::prepareToPlay (double sampleRate, int)

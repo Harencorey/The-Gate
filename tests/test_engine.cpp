@@ -1042,6 +1042,37 @@ static void testSpectralRestRampClean()
     CHECK (spec <= plain * 1.1 + 1e-4, "spectral step %.4f vs plain %.4f", spec, plain);
 }
 
+static void testSourceKey()
+{
+    std::printf ("Source key: a cymbal can't open it (it does open the plain key); toms pass from their first sample\n");
+    const double sr = 48000;
+    const size_t n = (size_t) (28 * sr);
+    std::vector<float> mix (n, 0.0f);
+    std::vector<size_t> toms, crashes;
+    for (int k = 0; k < 16; ++k) { const size_t a = (size_t) ((0.5 + 1.0 * k) * sr); sim::addTom (mix, a, 0.8f, 95, sr, (unsigned) k); toms.push_back (a); }
+    for (int k = 0; k < 8; ++k) { const size_t a = (size_t) ((17.5 + 1.25 * k) * sr); sim::addCrash (mix, a, 0.5f, sr, (unsigned) (40 + k)); crashes.push_back (a); }   // on their own, after the toms
+    Buf in = makeBuf (1, n); in[0] = mix;
+    tg::GateSettings s; s.thresholdDb = -30; s.hysteresisDb = 6; s.holdMs = 20; s.releaseMs = 150; s.lookaheadMs = 15;
+    auto passedDb = [&] (const Buf& o, size_t at, size_t L, double fromMs, double toMs) {   // out vs in energy over a window after an event
+        double ei = 0, eo = 0;
+        for (size_t i = at + (size_t) (fromMs * sr / 1000); i < at + (size_t) (toMs * sr / 1000); ++i) { ei += (double) in[0][i] * in[0][i]; eo += (double) o[0][i + L] * o[0][i + L]; }
+        return 10 * std::log10 ((eo + 1e-30) / (ei + 1e-30));
+    };
+    tg::GateEngine eP; Buf plain = run (in, s, sr, 256, nullptr, 1, &eP);
+    s.sourceKey = true;
+    tg::GateEngine eS; Buf src = run (in, s, sr, 256, nullptr, 1, &eS);
+    const size_t L = (size_t) eS.currentLatency();
+    int crashPlain = 0, crashSrc = 0; double worstTom = 0.0;
+    for (auto a : crashes) { crashPlain += passedDb (plain, a, L, 0, 30) > -20; crashSrc += passedDb (src, a, L, 0, 30) > -20; }
+    for (size_t k = 6; k < toms.size(); ++k) worstTom = std::min (worstTom, passedDb (src, toms[k], L, 0, 10));
+    std::printf ("  learned fundamental %.0f Hz (the tom: 95 Hz); crashes getting through: plain key %d of %zu, Source key %d; toms' first 10 ms at worst %+.2f dB vs the input\n",
+                 eS.sourceKeyHz(), crashPlain, crashes.size(), crashSrc, worstTom);
+    CHECK (std::abs (eS.sourceKeyHz() / 95.0 - 1.0) < 0.06, "fundamental %.0f Hz", eS.sourceKeyHz());
+    CHECK (crashPlain >= 6, "the test crash should open the plain key (%d)", crashPlain);
+    CHECK (crashSrc == 0, "%d crashes opened the Source key", crashSrc);
+    CHECK (worstTom > -0.5, "a tom's attack lost %.2f dB", worstTom);
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);
@@ -1078,6 +1109,7 @@ int main()
     testSpectralSustain();
     testSpectralTransientKnob();
     testSpectralRestRampClean();
+    testSourceKey();
     std::printf ("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILED", gFailures);
     return gFailures == 0 ? 0 : 1;
 }

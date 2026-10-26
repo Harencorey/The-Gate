@@ -60,7 +60,7 @@ struct GateSettings
     float trackingPct  = 0.0f;     // 0..100: how far the high cut closes as each hit decays
     bool  externalKey  = false;    // key from the sidechain input
     bool  sourceKey    = false;    // Source key: the level at the drum's learned fundamental, opening only on a stick attack
-    float sourceAttackDb = 12.0f;  // Source key: how far the high band must jump for a stick attack (0 = no check)
+    float sourceAttackDb = 6.0f;   // Source key: how far the high band must jump for a stick attack (0 = no check); 6 dB measured best
     bool  listen       = false;    // output the filtered key (what the detector hears)
 
     // Leveler

@@ -493,7 +493,7 @@ void TheGateEditor::paint (Graphics& g)
         const double f0 = proc.engine.sourceKeyHz();
         g.setColour (colours::level);
         g.setFont (FontOptions (11.0f));
-        g.drawText (f0 > 0.0 ? "listening at " + String (roundToInt (f0)) + " Hz + stick attack" : "learning the drum... (stick attack only)",
+        g.drawText (f0 > 0.0 ? "listening at " + String (roundToInt (f0)) + " Hz + stick attack (15 ms lookahead)" : "learning the drum... (stick attack only)",
                     sourceNote, Justification::centred);
     }
     // spectral decay is parked until the instance network (it needs to know what else was hit)
