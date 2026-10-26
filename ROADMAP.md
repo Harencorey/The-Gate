@@ -85,6 +85,12 @@ It ships in stages so every release is something usable in a real session.
 - Small classifier trained offline (Python), run in real time with RTNeural.
 - Features: tone, attack shape, decay, and a pitch curve (tracked per hit, since pitch glides and shifts with velocity). Pitch is evidence, not a hard rule.
 - Factory sources selectable from a menu (kick, snare, toms, bass guitar, guitar...). A Strictness control sets how sure it must be before opening.
+- **Findings so far (Oct 2026, 7 songs + Rock session):**
+    - Within one kit (trained on the other songs of the same kit): works. Snare 23% -> 93% of hits kept at 0.3% bleed; toms 77-96%.
+    - Across kits: does not transfer yet (needs many kits). Factory models wait for dedicated training sessions.
+    - Self-learning from one track with no help (`training/session_eval.py`): small gain, and unsafe on toms that are rarely played - in some songs most of what it would learn as "the tom" is really snare/kick bleed. Not shipped.
+    - Taught from ~8 clean hits the user points at: floor toms let through 40-70% fewer false opens than the Source key alone at 90% of hits kept; snare ~25% fewer; rack 2 no help (its own problem, to look at).
+    - So the learned check comes in as a user-controlled "Learn" step (Phase 5's guided capture moved forward), and it can only reject what the gate would open, never open it.
 
 ### Phase 5: User training and live learning
 - Guided two-step capture: "learn the source", then "learn the bleed", feeling like one gesture.
