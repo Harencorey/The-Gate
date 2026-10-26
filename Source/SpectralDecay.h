@@ -422,7 +422,20 @@ private:
         double maxDb = -400.0; int maxBin = lo;
         for (int i = lo; i <= hi; ++i) if (dbAt (i) > maxDb) { maxDb = dbAt (i); maxBin = i; }
         double top = 0.0;
-        fundHz = maxBin * binHz < 1000.0 ? maxBin * binHz : 0.0;   // the source's strongest low resonance
+        // the fundamental: the strongest low peak (40 Hz - 1 kHz, within 20 dB of the spectrum's peak) that
+        // the bleed doesn't explain - so the kick ringing in a floor tom mic can't claim it
+        fundHz = 0.0;
+        {
+            double best = -1e9; int bestBin = -1;
+            for (int i = lo; i <= std::min (hi, (int) (1000.0 / binHz)); ++i)
+            {
+                const double d = dbAt (i);
+                if (d < maxDb - 20.0 || d < dbAt (i - 1) || d < dbAt (i + 1)) continue;
+                const double over = bleeds > 0 ? d - 10.0 * std::log10 (std::max (bleedPow[(size_t) i], 1e-30)) : d;
+                if (over > best) { best = over; bestBin = i; }
+            }
+            if (bestBin > 0) fundHz = bestBin * binHz;
+        }
         if (maxBin * binHz < 1000.0)
         {
             const double sixth = std::pow (2.0, 1.0 / 6.0);

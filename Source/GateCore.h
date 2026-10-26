@@ -314,6 +314,15 @@ public:
             const bool wasOpen = detectorOpen;
             if (! detectorOpen && level >= thrOpen && (! s.sourceKey || s.sourceAttackDb <= 0.0f || attackRecent)) detectorOpen = true;
             else if (detectorOpen && level < thrClose)    detectorOpen = false;
+            if (s.sourceKey && srcF0 > 0.0 && detectorOpen && ! wasOpen)
+            {
+                // the fundamental takes a few ms to build up: open from where the hit really began (the
+                // stick attack, or the start of the key's rise), as far back as the lookahead still holds
+                const uint64_t began = std::min (clock, haveAttack && clock - lastAttack <= (uint64_t) attackWindow ? lastAttack : std::min (riseStart, levelRiseStart));
+                const uint64_t room = (uint64_t) std::max (0, delayForState - 1);
+                const uint64_t from = std::max (began >= (uint64_t) oneMs ? began - (uint64_t) oneMs : 0, clock >= room ? clock - room : 0);
+                for (uint64_t t = from; t < clock; ++t) stateRing[(size_t) (t & (uint64_t) ringMask)] = 1;
+            }
 
             //---------------- onsets: the gate opening, or a fresh stroke while it's open
             // Strokes are found on the key's slope (its first difference: "high-frequency
