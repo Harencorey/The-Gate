@@ -1073,6 +1073,74 @@ static void testSourceKey()
     CHECK (worstTom > -0.5, "a tom's attack lost %.2f dB", worstTom);
 }
 
+static void testLearn()
+{
+    std::printf ("Learn: taught on toms + soft snare bleed, it takes back loud snare bleed that opens the Source key; toms untouched\n");
+    const double sr = 48000;
+    const size_t n = (size_t) (60 * sr);
+    std::vector<float> mix (n, 0.0f);
+    std::vector<size_t> toms, snares;
+    for (int k = 0; k < 11; ++k)   // learn passage (from 5 s): toms with soft snare bleed between them
+    {
+        const size_t a = (size_t) ((0.5 + 1.5 * k) * sr);
+        sim::addTom (mix, a, 0.8f, 95, sr, (unsigned) k);
+        for (int j = 0; j < 2; ++j) sim::addSnare (mix, a + (size_t) ((0.75 + 0.35 * j) * sr), 0.3f, sr, (unsigned) (100 + 2 * k + j));
+    }
+    for (int k = 0; k < 20; ++k)   // then: toms, and snare bleed loud enough to open the Source key on its own
+    {
+        const size_t a = (size_t) ((18.5 + 2.0 * k) * sr);
+        sim::addTom (mix, a, (k % 3) == 0 ? 0.4f : 0.8f, 95, sr, (unsigned) (200 + k)); toms.push_back (a);
+        const size_t b = a + (size_t) (1.2 * sr);
+        sim::addSnare (mix, b, 3.0f, sr, (unsigned) (300 + k)); snares.push_back (b);
+    }
+    tg::GateSettings s; s.thresholdDb = -30; s.hysteresisDb = 6; s.holdMs = 20; s.releaseMs = 150; s.lookaheadMs = 15; s.sourceKey = true;
+    auto go = [&] (bool teach, tg::GateEngine& e, bool watch)
+    {
+        Buf out = makeBuf (1, n); out[0] = mix;
+        e.prepare (sr, 1); e.setSettings (s); e.reset();
+        if (watch) { gAllocCount = 0; gWatchAllocs = true; }
+        for (size_t pos = 0; pos < n; pos += 256)
+        {
+            const int bs = (int) std::min<size_t> (256, n - pos);
+            float* io[1] = { out[0].data() + pos };
+            tg::GateSettings b = s; b.learn = teach && pos >= (size_t) (5 * sr) && pos < (size_t) (16.5 * sr);
+            e.setSettings (b);
+            e.process (io, 1, nullptr, 0, bs);
+            tg::MeterFrame f; while (e.meters.pop (f)) {}
+            tg::Hit h; while (e.hits.pop (h)) {}
+        }
+        gWatchAllocs = false;
+        return out;
+    };
+    auto passedDb = [&] (const Buf& o, size_t at, size_t L, double fromMs, double toMs) {
+        double ei = 0, eo = 0;
+        for (size_t i = at + (size_t) (fromMs * sr / 1000); i < at + (size_t) (toMs * sr / 1000); ++i) { ei += (double) mix[i] * mix[i]; eo += (double) o[0][i + L] * o[0][i + L]; }
+        return 10 * std::log10 ((eo + 1e-30) / (ei + 1e-30));
+    };
+    tg::GateEngine e0, e1;
+    Buf plain = go (false, e0, false);
+    Buf taught = go (true, e1, true);
+    const long allocs = gAllocCount;
+    const size_t L = (size_t) e1.currentLatency();
+    int snPlain = 0, snTaught = 0, tomsLost = 0; double worstTom = 0.0;
+    // count only snares the gate had to OPEN for (some arrive while a loud tom's tail still holds it open)
+    int snFresh = 0;
+    for (auto b : snares)
+    {
+        if (passedDb (plain, b - (size_t) (0.015 * sr), L, 0, 10) > -20) continue;
+        ++snFresh; snPlain += passedDb (plain, b, L, 0, 30) > -20; snTaught += passedDb (taught, b, L, 0, 30) > -20;
+    }
+    for (auto a : toms) { const double d = passedDb (taught, a, L, 0, 10); worstTom = std::min (worstTom, d); tomsLost += d < -3; }
+    std::printf ("  learned from %d hits (%d seen) / %d bleed events; loud snares getting through: Source key %d of %zu, with Learn %d (taken back %d); "
+                 "toms lost %d of %zu, worst first 10 ms %+.2f dB; allocations %ld\n",
+                 e1.uiProfileHits.load(), e1.uiLearnHits.load(), e1.uiLearnBleeds.load(), snPlain, (size_t) snFresh, snTaught, e1.uiVetoes.load(), tomsLost, toms.size(), worstTom, allocs);
+    CHECK (e1.uiProfileHits.load() >= 6, "learned from only %d hits", e1.uiProfileHits.load());
+    CHECK (snFresh >= 10 && snPlain == snFresh, "the test snare should open the Source key (%d of %d)", snPlain, snFresh);
+    CHECK (snTaught == 0, "%d loud snares still got through with Learn", snTaught);
+    CHECK (tomsLost == 0 && worstTom > -0.5, "a tom was hurt: %d lost, worst %+.2f dB", tomsLost, worstTom);
+    CHECK (allocs == 0, "%ld allocations on the audio thread", allocs);
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);
@@ -1110,6 +1178,7 @@ int main()
     testSpectralTransientKnob();
     testSpectralRestRampClean();
     testSourceKey();
+    testLearn();
     std::printf ("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILED", gFailures);
     return gFailures == 0 ? 0 : 1;
 }

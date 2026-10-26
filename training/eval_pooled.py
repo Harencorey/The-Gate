@@ -20,7 +20,7 @@ WORK = "/home/claude/rr/work" + ("_" + "_".join(a.replace("=", "") for a in sys.
 MIC = {"snare": "snare_top", "rack1": "rack1", "rack2": "rack2", "floor1": "floor1", "floor2": "floor2"}
 if os.environ.get("DRUMS"): MIC = {d: m for d, m in MIC.items() if d in os.environ["DRUMS"].split(",")}
 BASE = ["hold=30", "rel=250", "la=5", "hpf=50", "range=-80"]
-THRS = list(range(int(os.environ.get("THR_LO", "-42")), -5, 3))
+THRS = list(range(int(os.environ.get("THR_LO", "-42")), int(os.environ.get("THR_HI", "-5")), 3))
 SR = 48000
 
 
@@ -58,8 +58,14 @@ def song_eval(args):
     if song == "song1" and drum in ("floor1", "floor2"): intro[3000:14800] = True
     inp = f"{WORK}/{song}_{drum}.in.f32"; x.astype(np.float32).tofile(inp)
     rows = []
+    # LEARN=n: arm Learn over the passage holding this drum's first n sure hits (the user picks a clean passage)
+    learn = []
+    nl = int(os.environ.get("LEARN", "0"))
+    if nl and len(sure) >= 4:
+        a, b = sure[0] / SR - 0.5, sure[min(nl, len(sure)) - 1] / SR + 0.3
+        learn = [f"learn={max(0.0, a):.3f}-{b:.3f}"]
     for t in THRS:
-        y = run(inp, f"{song}_{drum}_{t}", [f"thr={t}"])
+        y = run(inp, f"{song}_{drum}_{t}", [f"thr={t}"] + learn)
         g = gain_db(x, y)
         passed = sum(1 for s in sure if np.nanmean(g[s // 48: s // 48 + 10]) >= -3) if len(sure) else 0
         a = away & ~np.isnan(g)
@@ -88,8 +94,8 @@ for drum, per in res.items():
     ok = [r for r in table if r["leak_pct"] <= 2.0]
     best = max(ok, key=lambda r: (r["passed_pct"], -r["leak_pct"])) if ok else min(table, key=lambda r: r["leak_pct"])
     # spectral decay off vs on at that threshold, pooled over songs
-    w_off = w_on = b_off = b_on = 0.0
-    for song, n, inp, sure, _ in per:
+    w_off = w_on = b_off = b_on = 1.0
+    for song, n, inp, sure, _ in ([] if os.environ.get("NOSPEC") else per):
         if n == 0: continue
         yo = run(inp, f"{song}_{drum}_off", [f"thr={best['thr']}"])
         yn = run(inp, f"{song}_{drum}_on", [f"thr={best['thr']}", "spec=1", "focus=60", "sustain=0"])

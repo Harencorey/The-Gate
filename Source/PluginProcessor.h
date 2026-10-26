@@ -46,12 +46,19 @@ public:
 
     bool sidechainConnected() const noexcept { return sidechainActive.load(); }
 
+    // Learn (not a parameter: it's an action, not something to automate)
+    std::atomic<bool> learnArmed { false };
+    void clearLearned() noexcept { engine.clearProfileRequest.store (true); }
+
 private:
     void timerCallback() override;   // keeps the reported latency in step with the Lookahead choice
     tg::GateSettings readSettings() const noexcept;
     int latencyForCurrentChoice() const noexcept;
     float effectiveLookaheadMs() const noexcept;
     static constexpr float kSourceMinLookaheadMs = 15.0f;
+public:
+    static constexpr float kStrictnessDefault = 50.0f;
+private:
 
     struct Raw
     {
@@ -59,8 +66,12 @@ private:
                           * lookahead {}, * keySource {}, * keyHpf {}, * keyHighCut {}, * tracking {}, * listen {},
                           * levelerOn {}, * levelAmount {}, * levelTarget {}, * levelMax {},
                           * glowOn {}, * glowType {}, * glowDrive {}, * glowEnv {},
-                          * specOn {}, * specFocus {}, * specSustain {}, * specTransient {};
+                          * specOn {}, * specFocus {}, * specSustain {}, * specTransient {}, * strictness {};
     } raw;
+
+    void drainProfile();                      // message thread: newest learned profile from the engine
+    juce::SpinLock profileLock;
+    tg::ToneProfile savedProfile;             // what gets saved with the session
 
     double currentRate = 0.0;
     std::atomic<bool> sidechainActive { false };

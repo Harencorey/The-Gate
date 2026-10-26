@@ -19,6 +19,7 @@ int main (int argc, char** argv)
     const double sr = std::atof (argv[4]);
     tg::GateSettings s;
     s.rangeDb = -80.0f;
+    double learnFrom = -1.0, learnTo = -1.0;   // learn=a-b: Learn armed from a to b seconds
     for (int a = 5; a < argc; ++a)
     {
         std::string kv = argv[a];
@@ -26,6 +27,7 @@ int main (int argc, char** argv)
         if (eq == std::string::npos) continue;
         const std::string k = kv.substr (0, eq);
         const float v = (float) std::atof (kv.c_str() + eq + 1);
+        if (k == "learn") { std::sscanf (kv.c_str() + eq + 1, "%lf-%lf", &learnFrom, &learnTo); continue; }
         if      (k == "thr")     s.thresholdDb = v;
         else if (k == "hyst")    s.hysteresisDb = v;
         else if (k == "att")     s.attackMs = v;
@@ -43,6 +45,7 @@ int main (int argc, char** argv)
         else if (k == "lev")     s.levelerOn = v > 0.5f;
         else if (k == "src")     s.sourceKey = v > 0.5f;
         else if (k == "srcatk")  s.sourceAttackDb = v;
+        else if (k == "strict")  s.strictness = v;
         else { std::fprintf (stderr, "unknown setting %s\n", k.c_str()); return 1; }
     }
     FILE* f = std::fopen (argv[1], "rb");
@@ -68,6 +71,7 @@ int main (int argc, char** argv)
         const int len = (int) std::min<long> (B, n + L - p);
         for (int i = 0; i < len; ++i) buf[(size_t) i] = p + i < n ? x[(size_t) (p + i)] : 0.0f;
         float* io[1] = { buf.data() };
+        s.learn = learnFrom >= 0.0 && p >= (long) (learnFrom * sr) && p < (long) (learnTo * sr);
         eng->setSettings (s);
         eng->process (io, 1, nullptr, 0, len);
         std::memcpy (y.data() + p, buf.data(), sizeof (float) * (size_t) len);
@@ -81,6 +85,9 @@ int main (int argc, char** argv)
     std::fwrite (y.data() + L, sizeof (float), (size_t) n, of);
     std::fclose (of);
     std::fprintf (stderr, "latency %d samples, %ld samples processed, source key at %.1f Hz\n", L, n, eng->sourceKeyHz());
+    if (learnFrom >= 0.0)
+        std::fprintf (stderr, "learn: profile from %d hits (%s), %d bleed events seen; %d openings taken back\n",
+                      eng->uiProfileHits.load(), eng->uiLearnFailed.load() ? "FAILED: not enough" : "ok", eng->uiLearnBleeds.load(), eng->uiVetoes.load());
     auto& sd = eng->spectralDecay();
     std::fprintf (stderr, "spectral: %d hits learned, %d bleed captures, body band to %.0f Hz, attack %.1f ms\n", sd.hitsLearned(), sd.bleedsLearned(), sd.bodyTopHz(), sd.transientMs());
     if (s.spectral.on)

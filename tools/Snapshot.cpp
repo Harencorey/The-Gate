@@ -46,14 +46,19 @@ int main (int argc, char** argv)
     set (tg::pid::specOn, 1.0f);
     set (tg::pid::specFocus, 70.0f);
     set (tg::pid::specSustain, 40.0f);
+    set (tg::pid::keySource, 2.0f);          // Source key, with Learn
+    set (tg::pid::threshold, -20.0f);
     p.prepareToPlay (sr, 256);
+    // mode (2nd arg): "learning" = Learn still lit at the end; otherwise learn over the first half, then use it
+    const bool stillLearning = argc > 2 && String (argv[2]) == "learning";
 
     // the simulated tom mic (tests/DrumSim.h): toms with hats, snare and crashes bleeding in
-    auto ses = sim::tomMicSession (sr, 14);
+    auto ses = sim::tomMicSession (sr, 40);
     const int n = (int) ses.mix.size();
     AudioBuffer<float> sig (2, n);
     for (int i = 0; i < n; ++i) { sig.setSample (0, i, ses.mix[(size_t) i]); sig.setSample (1, i, ses.mix[(size_t) i]); }
 
+    p.learnArmed.store (stillLearning);
     std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
     ed->setVisible (true);
     MidiBuffer midi;
@@ -63,6 +68,7 @@ int main (int argc, char** argv)
     {
         blk.clear();
         for (int c = 0; c < 2; ++c) blk.copyFrom (c, 0, sig, c, pos, 256);
+        if (! stillLearning) p.learnArmed.store (pos > (int) (1.0 * sr) && pos < end * 3 / 4);
         p.processBlock (blk, midi);
         // let the editor drain the meter FIFO as its timer would
         if (pos % (256 * 8) == 0)
@@ -75,6 +81,8 @@ int main (int argc, char** argv)
         if (auto* sv = dynamic_cast<SpectrumView*> (c)) sv->pull();
     }
 
+    std::fprintf (stderr, "learn: %d hits / %d bleeds seen, profile %d hits, failed %d, vetoes %d\n", p.engine.uiLearnHits.load(), p.engine.uiLearnBleeds.load(),
+                  p.engine.uiProfileHits.load(), (int) p.engine.uiLearnFailed.load(), p.engine.uiVetoes.load());
     auto img = ed->createComponentSnapshot (ed->getLocalBounds(), true, 2.0f);
     File out (argc > 1 ? String (argv[1]) : String ("snapshot.png"));
     out.deleteFile();

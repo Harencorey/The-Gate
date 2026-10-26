@@ -105,7 +105,8 @@ private:
     GateDisplay display;
 
     Knob threshold, hysteresis, attack, hold, release, range, keyHpf, keyHighCut, tracking;
-    Knob levelAmount, levelTarget, levelMax, specTransient, specFocus, specSustain;
+    Knob levelAmount, levelTarget, levelMax, specTransient, specFocus, specSustain, strictness;
+    juce::TextButton learnBtn { "LEARN" }, clearBtn { "CLEAR" };
     ConcentricKnob glowDrive;
     SpectrumView spectrum;
     Choice lookahead, keySource, glowType;
@@ -113,7 +114,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> listenAtt, levelerOnAtt, glowOnAtt, specOnAtt;
     juce::TooltipWindow tooltips { this, 3000 };
 
-    juce::Rectangle<int> detectArea, envArea, keyArea, levelArea, specArea, glowArea, sourceNote;
+    juce::Rectangle<int> detectArea, envArea, keyArea, levelArea, specArea, glowArea, sourceNote, learnNote;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TheGateEditor)
 };

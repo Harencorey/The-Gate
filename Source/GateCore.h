@@ -36,6 +36,9 @@
 #include "MicroGlow.h"
 #include "Svf.h"
 #include "SpectralDecay.h"
+#include "LearnedTone.h"
+
+#include <atomic>
 
 #include <algorithm>
 #include <cmath>
@@ -62,6 +65,10 @@ struct GateSettings
     bool  sourceKey    = false;    // Source key: the level at the drum's learned fundamental, opening only on a stick attack
     float sourceAttackDb = 6.0f;   // Source key: how far the high band must jump for a stick attack (0 = no check); 6 dB measured best
     bool  listen       = false;    // output the filtered key (what the detector hears)
+
+    // Learn (Source key only): see LearnedTone.h
+    bool  learn        = false;    // armed: openings are learned as the drum, unopened stick attacks as bleed
+    float strictness   = 50.0f;    // 0..100: how much like the learned drum an opening must sound (0 = check off)
 
     // Leveler
     bool  levelerOn    = false;
@@ -122,6 +129,12 @@ public:
         atkRel = std::exp (-1.0 / (0.005 * sr)); atkRise = 1.0 - std::exp (-1.0 / (0.030 * sr));
         atkHoldLen = (int) std::lround (0.002 * sr); attackWindow = (int) std::lround (0.010 * sr);
         spectral.prepare (sr, numCh);
+        tone.prepare (sr);
+        {
+            const size_t need = (size_t) std::ceil (0.100 * sr);
+            size_t n = 1; while (n < need) n <<= 1;
+            toneRaw.assign (n, 0.0f); toneSrc.assign (n, 0.0f); toneHi.assign (n, 0.0f); toneMask = n - 1;
+        }
         reset();
     }
 
@@ -133,6 +146,9 @@ public:
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
         std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
         spectral.reset();
+        std::fill (toneRaw.begin(), toneRaw.end(), 0.0f); std::fill (toneSrc.begin(), toneSrc.end(), 0.0f); std::fill (toneHi.begin(), toneHi.end(), 0.0f);
+        checkActive = vetoBlock = false; numLearnHits = numBleedCands = 0; lastOpenBegan = 0; haveOpenBegan = false; lastBleedCand = 0;
+        if (learning) tone.clearLearning();
         atkHp1.reset(); atkHp2.reset(); srcBp1.reset(); srcBp2.reset(); atkEnv = atkValley = srcPeak = srcRms = 0.0; atkHoldLeft = 0; haveAttack = false; lastAttack = 0; srcF0 = 0.0;
         writePos = 0;
         clock = 0;
@@ -226,6 +242,27 @@ public:
         const double lvlStepOff = 1.0 / std::max (1.0, 0.010 * sr);   // 10 ms on/off glide
         float glowFrame[kMaxChannels];
 
+        //---------------- Learn: profile loaded from a session / cleared by the user / Learn switched on or off
+        {
+            ToneProfile in;
+            while (profileIn.pop (in)) { profile = in; uiProfileHits.store (profile.valid ? profile.hits : 0); }
+            if (clearProfileRequest.exchange (false)) { profile = {}; uiProfileHits.store (0); profileOut.push (profile); }
+            const bool wantLearn = s.learn && s.sourceKey;
+            if (wantLearn && ! learning) { tone.clearLearning(); numLearnHits = numBleedCands = 0; uiLearnFailed.store (false); }
+            if (! wantLearn && learning)
+            {
+                ToneProfile q;
+                if (tone.finish (q, (float) srcF0)) { profile = q; uiProfileHits.store (q.hits); profileOut.push (profile); uiLearnFailed.store (false); }
+                else uiLearnFailed.store (true);
+            }
+            learning = wantLearn;
+            const double st = std::clamp ((double) s.strictness, 0.0, 100.0);
+            checkOn = ! learning && profile.valid && s.sourceKey && st > 0.0;
+            checkThr = kStrictZeroZ + (kStrictFullZ - kStrictZeroZ) * st / 100.0;
+        }
+        const uint64_t toneN = (uint64_t) tone.window();
+        const uint64_t tenMs = (uint64_t) std::lround (0.010 * sr), thirtyMs = (uint64_t) std::lround (0.030 * sr);
+
         for (int i = 0; i < numSamples; ++i)
         {
             if ((clock % kCoeffEvery) == 0)
@@ -271,9 +308,9 @@ public:
             // 10 ms of a stick attack (the key's high band jumping 12 dB). Closing follows the
             // fundamental alone. Until the fundamental is learned it uses the normal key level, with
             // the same stick-attack check.
-            double srcBand = 0.0;
+            double srcBand = 0.0, hk = 0.0;
             {
-                double a1, hk;
+                double a1;
                 atkHp1.tick (k, a1); atkHp2.tick (a1, hk);
                 const double ah = std::abs (hk);
                 if (ah >= atkEnv) { atkEnv = ah; atkHoldLeft = atkHoldLen; }
@@ -284,10 +321,16 @@ public:
                 if (atkEnv > atkJump * atkValley && atkEnv > 1e-5) { lastAttack = clock; haveAttack = true; atkValley = atkEnv; }
                 if ((clock % 4096) == 0)
                 {
-                    const double f0 = spectral.fundamentalHz();
+                    // a learned profile pins the fundamental to the drum it was taught on (loud bleed - a snare in
+                    // a tom mic - can otherwise drag the running estimate onto its own pitch)
+                    const double f0 = (profile.valid && ! learning && profile.f0Hz > 0.0f) ? (double) profile.f0Hz : spectral.fundamentalHz();
                     if (f0 > 0.0 && std::abs (f0 - srcF0) > 0.5) { srcF0 = f0; srcBp1.setup (f0, sr, 2.0); srcBp2.setup (f0, sr, 2.0); }
                 }
                 if (srcF0 > 0.0) srcBand = srcBp2.bandPass (srcBp1.bandPass (hp));
+            }
+            {
+                const size_t tw = (size_t) (clock & (uint64_t) toneMask);
+                toneRaw[tw] = (float) k; toneSrc[tw] = (float) srcBand; toneHi[tw] = (float) hk;
             }
 
             double kf = hp;
@@ -312,7 +355,10 @@ public:
             const bool attackRecent = haveAttack && clock - lastAttack <= (uint64_t) attackWindow;
 
             const bool wasOpen = detectorOpen;
-            if (! detectorOpen && level >= thrOpen && (! s.sourceKey || s.sourceAttackDb <= 0.0f || attackRecent)) detectorOpen = true;
+            // after the learned check took an opening back: stay shut on that event, until it has died away or a
+            // fresh stick attack comes in at least 50 ms later (bleed like a snare keeps flickering its own attack)
+            if (vetoBlock && (level < thrClose || (haveAttack && lastAttack > vetoAttack + 5 * tenMs))) vetoBlock = false;
+            if (! detectorOpen && ! vetoBlock && level >= thrOpen && (! s.sourceKey || s.sourceAttackDb <= 0.0f || attackRecent)) detectorOpen = true;
             else if (detectorOpen && level < thrClose)    detectorOpen = false;
             if (s.sourceKey && srcF0 > 0.0 && detectorOpen && ! wasOpen)
             {
@@ -322,6 +368,76 @@ public:
                 const uint64_t room = (uint64_t) std::max (0, delayForState - 1);
                 const uint64_t from = std::max (began >= (uint64_t) oneMs ? began - (uint64_t) oneMs : 0, clock >= room ? clock - room : 0);
                 for (uint64_t t = from; t < clock; ++t) stateRing[(size_t) (t & (uint64_t) ringMask)] = 1;
+                lastOpenBegan = began; haveOpenBegan = true;
+                if (learning)
+                {
+                    if (numLearnHits < kMaxLearnQ) learnHitQ[numLearnHits++] = began;
+                }
+                else if (checkOn && ! checkActive)
+                {
+                    // measure the first 12 ms of this hit, and decide before the opening reaches the output
+                    checkActive = true; checkE = began; checkFrom = from;
+                    const uint64_t latest = from + (uint64_t) std::max (1, delayForState - 1);
+                    checkAt = std::max (clock, std::min (began + toneN, latest));
+                }
+            }
+
+            //---------------- Learn / learned check
+            if (checkActive && clock >= checkAt)
+            {
+                checkActive = false;
+                float f[ToneProfile::kFeatures];
+                tone.measure (toneRaw.data(), toneSrc.data(), toneHi.data(), toneMask, checkE, (int) (checkAt - checkE), f);
+                const double z = ToneLearner::score (profile, f);
+                uiLastScore.store ((float) z);
+                if (z < checkThr)
+                {
+                    // sounds like the bleed: take the opening back (none of it has reached the output yet)
+                    for (uint64_t t = checkFrom; t < clock; ++t) stateRing[(size_t) (t & (uint64_t) ringMask)] = 0;
+                    detectorOpen = false;
+                    vetoBlock = true; vetoAttack = lastAttack;
+                    uiVetoes.fetch_add (1);
+                }
+            }
+            if (learning)
+            {
+                // hits: every opening, measured once its first 12 ms are in
+                for (int q = 0; q < numLearnHits;)
+                {
+                    if (clock >= learnHitQ[q] + toneN)
+                    {
+                        float f[ToneProfile::kFeatures];
+                        tone.measure (toneRaw.data(), toneSrc.data(), toneHi.data(), toneMask, learnHitQ[q], (int) toneN, f);
+                        tone.addHit (f);
+                        learnHitQ[q] = learnHitQ[--numLearnHits];
+                        continue;
+                    }
+                    ++q;
+                }
+                // bleed: a stick attack while the gate is shut that doesn't open it
+                if (haveAttack && lastAttack == clock && ! detectorOpen && (lastBleedCand == 0 || clock - lastBleedCand >= thirtyMs)
+                    && numBleedCands < kMaxLearnQ && clock > toneN + thirtyMs)
+                {
+                    bleedCandQ[numBleedCands++] = clock; lastBleedCand = clock;
+                }
+                for (int q = 0; q < numBleedCands;)
+                {
+                    const uint64_t c = bleedCandQ[q];
+                    if (clock >= c + toneN + tenMs)
+                    {
+                        const bool opened = haveOpenBegan && lastOpenBegan + tenMs >= c && lastOpenBegan <= c + tenMs;
+                        if (! opened)
+                        {
+                            float f[ToneProfile::kFeatures];
+                            tone.measure (toneRaw.data(), toneSrc.data(), toneHi.data(), toneMask, c, (int) toneN, f);
+                            tone.addBleed (f);
+                        }
+                        bleedCandQ[q] = bleedCandQ[--numBleedCands];
+                        continue;
+                    }
+                    ++q;
+                }
+                uiLearnHits.store (tone.learnedHits()); uiLearnBleeds.store (tone.learnedBleeds());
             }
 
             //---------------- onsets: the gate opening, or a fresh stroke while it's open
@@ -601,6 +717,15 @@ public:
     float glowAutoGainDb() const noexcept { return glow.autoGainDb(); }
     SpectralDecay& spectralDecay() noexcept { return spectral; }   // learned partials, UI snapshots
 
+    // Learn: profiles in (from a saved session) and out (to save), plus status for the UI (any thread)
+    SpscFifo<ToneProfile, 4> profileIn, profileOut;
+    std::atomic<bool> clearProfileRequest { false }, uiLearnFailed { false };
+    std::atomic<int> uiLearnHits { 0 }, uiLearnBleeds { 0 }, uiProfileHits { 0 }, uiVetoes { 0 };
+    std::atomic<float> uiLastScore { 0.0f };
+    bool isLearning() const noexcept { return learning; }
+    // Strictness 0..100 maps to this range of the score (0 = like the learned bleed, 1 = like the learned hits)
+    static constexpr double kStrictZeroZ = -0.5, kStrictFullZ = 1.0;
+
 private:
     static double dbToGain (double db) noexcept { return db <= kFullyShutDb ? 0.0 : std::pow (10.0, db / 20.0); }
     static double gainToDb (double gn) noexcept { return gn <= 1e-6 ? -120.0 : 20.0 * std::log10 (gn); }
@@ -725,6 +850,18 @@ private:
 
     MicroGlow glow;
     SpectralDecay spectral;
+
+    // Learn
+    ToneLearner tone;
+    ToneProfile profile;
+    std::vector<float> toneRaw, toneSrc, toneHi;
+    size_t toneMask = 0;
+    bool learning = false, checkOn = false, checkActive = false, vetoBlock = false, haveOpenBegan = false;
+    double checkThr = 0.0;
+    uint64_t checkE = 0, checkFrom = 0, checkAt = 0, vetoAttack = 0, lastOpenBegan = 0, lastBleedCand = 0;
+    static constexpr int kMaxLearnQ = 16;
+    uint64_t learnHitQ[kMaxLearnQ] {}, bleedCandQ[kMaxLearnQ] {};
+    int numLearnHits = 0, numBleedCands = 0;
 
     double g = 0.0, gFloor = 0.0, gFloorTarget = 0.0, floorCoef = 0.0;
     double attackSamples = 24.0, attackFrom = 0.0, attackPhase = 0.0, releaseCoef = 0.999;

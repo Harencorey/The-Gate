@@ -401,6 +401,17 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     setupOn (specOn,    tg::pid::specOn,    specOnAtt,    "Spectral decay on/off. Each hit's attack stays exactly the plain gate; then the highs close from the top down as the drum decays, and its low end can sustain. Zero latency, no phase shift.");
     setupOn (glowOn,    tg::pid::glowOn,    glowOnAtt,    "Micro Glow on/off: Glow's saturation at the output, after the gate and leveler. Oversampled to ~384 kHz, linear-phase, loudness-matched. Switching it never changes the latency.");
 
+    // Learn: teach the gate this drum from a passage you pick
+    makeKnob (strictness, tg::pid::strictness, "STRICTNESS", "How much like the learned drum an opening must sound before it's let through. 0 % = the learned check is off (the Source key alone). Higher = more bleed taken out, and more risk of losing a soft or odd hit. The check only ever takes openings away; it never opens the gate.");
+    learnBtn.setClickingTogglesState (true);
+    learnBtn.setTooltip ("Press, play (or loop) a passage with clean hits of this drum, press again. Every opening while it's lit is learned as the drum; stick attacks that don't open the gate are learned as bleed. Set the threshold so only real hits open it while you learn. Needs Key = Source.");
+    learnBtn.onClick = [this] { proc.learnArmed.store (learnBtn.getToggleState()); };
+    learnBtn.setToggleState (proc.learnArmed.load(), dontSendNotification);
+    addAndMakeVisible (learnBtn);
+    clearBtn.setTooltip ("Forget what was learned (back to the Source key alone).");
+    clearBtn.onClick = [this] { proc.clearLearned(); };
+    addAndMakeVisible (clearBtn);
+
     listen.setClickingTogglesState (true);
     listen.setTooltip ("Hear the key exactly as the detector hears it (after the key HPF and high cut).");
     addAndMakeVisible (listen);
@@ -454,6 +465,15 @@ void TheGateEditor::timerCallback()
     for (auto* k : { &specTransient, &specFocus, &specSustain }) { k->slider.setAlpha (spc); k->label.setAlpha (spc); }
     spectrum.setAlpha (spc);
     repaint (sourceNote);
+    repaint (learnNote);
+    {
+        const bool src = (int) std::lround (proc.apvts.getRawParameterValue (tg::pid::keySource)->load()) == 2;
+        learnBtn.setEnabled (src || learnBtn.getToggleState());
+        const bool have = proc.engine.uiProfileHits.load() > 0;
+        clearBtn.setEnabled (have);
+        const float a = src && have ? 1.0f : 0.4f;
+        strictness.slider.setAlpha (a); strictness.label.setAlpha (a);
+    }
     glowType.box.setAlpha (glw); glowType.label.setAlpha (glw);
     glowDrive.setModulated (proc.engine.glowModulatedDrive());
 }
@@ -470,7 +490,7 @@ void TheGateEditor::paint (Graphics& g)
     g.drawText ("NORKA DSP   v" + String (JucePlugin_VersionString), header, Justification::centredRight);
 
     for (auto [area, title] : { std::pair { detectArea, "DETECT" }, std::pair { envArea, "ENVELOPE" }, std::pair { keyArea, "KEY FILTERS" },
-                                std::pair { levelArea, "LEVELER" }, std::pair { specArea, "SPECTRAL DECAY" }, std::pair { glowArea, "MICRO GLOW" } })
+                                std::pair { levelArea, "LEVELER" }, std::pair { specArea, "LEARN" }, std::pair { glowArea, "MICRO GLOW" } })
     {
         g.setColour (colours::panel);
         g.fillRoundedRectangle (area.toFloat(), 6.0f);
@@ -496,11 +516,51 @@ void TheGateEditor::paint (Graphics& g)
         g.drawText (f0 > 0.0 ? "listening at " + String (roundToInt (f0)) + " Hz + stick attack (15 ms lookahead)" : "learning the drum... (stick attack only)",
                     sourceNote, Justification::centred);
     }
-    // spectral decay is parked until the instance network (it needs to know what else was hit)
-    g.setColour (colours::dim);
-    g.setFont (FontOptions (12.0f));
-    g.drawFittedText ("Parked for now: comes back once the instances can tell each other\nwhat was hit (Phase 6). The gate decides everything; this will only ever take bleed away.",
-                      specArea.reduced (16, 30), Justification::centred, 3);
+    // Learn status
+    {
+        auto& e = proc.engine;
+        const int have = e.uiProfileHits.load();
+        String line1, line2;
+        Colour c = colours::text;
+        if (keyMode != 2 && ! learnBtn.getToggleState())
+        {
+            line1 = "Learn works with Key = Source.";
+            line2 = have > 0 ? "A profile from " + String (have) + " hits is kept for when you switch back." : String();
+            c = colours::dim;
+        }
+        else if (learnBtn.getToggleState())
+        {
+            line1 = "Learning: " + String (e.uiLearnHits.load()) + " hits, " + String (e.uiLearnBleeds.load()) + " bleed events";
+            line2 = "Play a passage with clean hits, then press LEARN again.";
+            c = colours::accent;
+        }
+        else if (e.uiLearnFailed.load())
+        {
+            line1 = "Not enough to learn from: it needs 4+ hits that open";
+            line2 = "the gate and 10+ stick attacks from other drums that don't.";
+            c = colours::accent;
+        }
+        else if (have > 0)
+        {
+            line1 = "Learned from " + String (have) + " hits. Checking every opening.";
+            line2 = "Openings taken back as bleed: " + String (e.uiVetoes.load());
+            c = colours::level;
+        }
+        else
+        {
+            line1 = "Press LEARN, play a passage with clean hits of this";
+            line2 = "drum, press LEARN again. Off until then.";
+            c = colours::dim;
+        }
+        g.setColour (c);
+        g.setFont (FontOptions (12.0f));
+        auto ln = learnNote;
+        g.drawText (line1, ln.removeFromTop (18), Justification::centredLeft);
+        g.setColour (colours::dim);
+        g.drawText (line2, ln.removeFromTop (18), Justification::centredLeft);
+        g.setFont (FontOptions (10.0f));
+        g.drawText ("Spectral decay is parked until Phase 6.", ln.removeFromBottom (14), Justification::centredLeft);
+    }
 }
 
 void TheGateEditor::resized()
@@ -566,6 +626,18 @@ void TheGateEditor::resized()
     glowArea = row2;
     levelerOn.setBounds (levelArea.getRight() - 54, levelArea.getY() + 6, 44, 20);
     specOn.setBounds (specArea.getRight() - 54, specArea.getY() + 6, 44, 20);
+    {
+        auto a = specArea.reduced (8).withTrimmedTop (22);
+        auto k = a.removeFromLeft (100);
+        placeKnob (strictness, k.removeFromTop (120));
+        a.removeFromLeft (10);
+        auto btns = a.removeFromTop (30);
+        learnBtn.setBounds (btns.removeFromLeft (120).reduced (0, 2));
+        btns.removeFromLeft (10);
+        clearBtn.setBounds (btns.removeFromLeft (80).reduced (0, 2));
+        a.removeFromTop (8);
+        learnNote = a;
+    }
     {
         auto a = specArea.reduced (8).withTrimmedTop (22);
         auto knobs = a.removeFromLeft (234);

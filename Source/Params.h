@@ -33,6 +33,9 @@ namespace tg::pid
     inline constexpr const char* specFocus   = "specFocus";
     inline constexpr const char* specSustain = "specSustain";
     inline constexpr const char* specTransient = "specTransient";
+
+    // Phase 5: Learn
+    inline constexpr const char* strictness  = "strictness";
 }
 
 namespace tg

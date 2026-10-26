@@ -5,6 +5,7 @@
 
 #include "PluginProcessor.h"
 #include <cstdio>
+#include <cstring>
 
 static int failures = 0;
 #define CHECK(cond, ...) \
@@ -191,6 +192,37 @@ static void testSourceKeyLatency()
     CHECK (after >= 720 + 48 && after > before, "Source key latency %d (plain %d)", after, before);
 }
 
+static void testLearnedProfileSaved()
+{
+    std::printf ("Learn: the learned profile is saved with the session and comes back on load; a session without one clears it\n");
+    TheGateProcessor a;
+    setLayout (a, AudioChannelSet::mono(), AudioChannelSet::disabled());
+    a.prepareToPlay (48000, 256);
+    tg::ToneProfile q;
+    q.valid = true; q.hits = 9; q.bleeds = 40; q.f0Hz = 101.5f; q.scoreHit = 12.0f; q.scoreBleed = -3.0f;
+    for (int k = 0; k < tg::ToneProfile::kFeatures; ++k) { q.muHit[k] = (float) k; q.varHit[k] = 2.0f + k; q.muBleed[k] = -(float) k; q.varBleed[k] = 3.0f; }
+    a.engine.profileOut.push (q);   // as if the engine had just finished learning
+    MemoryBlock mb; a.getStateInformation (mb);
+
+    TheGateProcessor b;
+    setLayout (b, AudioChannelSet::mono(), AudioChannelSet::disabled());
+    b.prepareToPlay (48000, 256);
+    b.setStateInformation (mb.getData(), (int) mb.getSize());
+    AudioBuffer<float> buf (1, 256); buf.clear(); MidiBuffer midi;
+    b.processBlock (buf, midi);
+    const int got = b.engine.uiProfileHits.load();
+    MemoryBlock mb2; b.getStateInformation (mb2);
+    const bool same = mb2.getSize() == mb.getSize() && std::memcmp (mb2.getData(), mb.getData(), mb.getSize()) == 0;
+    std::printf ("  restored a profile from %d hits; saved again identically: %s\n", got, same ? "yes" : "no");
+    CHECK (got == 9, "profile not restored (%d hits)", got);
+    CHECK (same, "the re-saved session differs");
+
+    TheGateProcessor c; MemoryBlock empty; c.getStateInformation (empty);   // a session with nothing learned
+    b.setStateInformation (empty.getData(), (int) empty.getSize());
+    b.processBlock (buf, midi);
+    CHECK (b.engine.uiProfileHits.load() == 0, "loading a session without a profile didn't clear it");
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);   // so a crash still shows which test was running
@@ -201,6 +233,7 @@ int main()
     testStateRoundTrip();
     testPhase2Params();
     testSourceKeyLatency();
+    testLearnedProfileSaved();
     std::printf ("\n%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }

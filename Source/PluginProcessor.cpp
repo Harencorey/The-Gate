@@ -73,6 +73,9 @@ AudioProcessorValueTreeState::ParameterLayout TheGateProcessor::createLayout()
     ps.push_back (std::make_unique<P> (ParameterID { tg::pid::specTransient, 1 }, "Spectral Transient", NormalisableRange<float> (-100.0f, 100.0f, 0.1f), 0.0f,
                                        A().withLabel ("%").withStringFromValueFunction ([] (float v, int)
                                            { return (v > 0.05f ? "+" : "") + String (roundToInt (v)) + " %"; })));
+
+    // Learn
+    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::strictness, 1 }, "Strictness", NormalisableRange<float> (0.0f, 100.0f, 0.1f), kStrictnessDefault, pct));
     return { ps.begin(), ps.end() };
 }
 
@@ -108,6 +111,7 @@ TheGateProcessor::TheGateProcessor()
     raw.specFocus   = apvts.getRawParameterValue (tg::pid::specFocus);
     raw.specSustain = apvts.getRawParameterValue (tg::pid::specSustain);
     raw.specTransient = apvts.getRawParameterValue (tg::pid::specTransient);
+    raw.strictness  = apvts.getRawParameterValue (tg::pid::strictness);
 
     engine.prepare (48000.0, 2);
     startTimerHz (10);
@@ -160,6 +164,8 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.spectral.focus   = raw.specFocus->load();
     s.spectral.sustain = raw.specSustain->load();
     s.spectral.transient = raw.specTransient->load();
+    s.learn        = learnArmed.load();
+    s.strictness   = raw.strictness->load();
     return s;
 }
 
@@ -186,8 +192,16 @@ void TheGateProcessor::prepareToPlay (double sampleRate, int)
     setLatencySamples (engine.currentLatency());
 }
 
+void TheGateProcessor::drainProfile()
+{
+    const SpinLock::ScopedLockType sl (profileLock);
+    tg::ToneProfile p;
+    while (engine.profileOut.pop (p)) savedProfile = p;
+}
+
 void TheGateProcessor::timerCallback()
 {
+    drainProfile();
     // Message thread: report a new latency to the host after the Lookahead choice changes.
     if (currentRate > 0.0)
     {
@@ -244,6 +258,23 @@ void TheGateProcessor::getStateInformation (MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     state.setProperty ("version", JucePlugin_VersionString, nullptr);
+    drainProfile();
+    tg::ToneProfile p;
+    { const SpinLock::ScopedLockType sl (profileLock); p = savedProfile; }
+    if (p.valid)
+    {
+        // the learned profile travels with the session (a few hundred numbers, not audio)
+        ValueTree t ("LearnedTone");
+        t.setProperty ("hits", p.hits, nullptr);
+        t.setProperty ("bleeds", p.bleeds, nullptr);
+        t.setProperty ("f0", p.f0Hz, nullptr);
+        t.setProperty ("scoreHit", p.scoreHit, nullptr);
+        t.setProperty ("scoreBleed", p.scoreBleed, nullptr);
+        MemoryBlock mb;
+        for (auto* arr : { p.muHit, p.varHit, p.muBleed, p.varBleed }) mb.append (arr, sizeof (float) * tg::ToneProfile::kFeatures);
+        t.setProperty ("data", mb.toBase64Encoding(), nullptr);
+        state.appendChild (t, nullptr);
+    }
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -252,7 +283,28 @@ void TheGateProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (apvts.state.getType()))
-            apvts.replaceState (ValueTree::fromXml (*xml));
+        {
+            auto state = ValueTree::fromXml (*xml);
+            tg::ToneProfile p;
+            auto t = state.getChildWithName ("LearnedTone");
+            if (t.isValid())
+            {
+                MemoryBlock mb;
+                constexpr size_t n = sizeof (float) * tg::ToneProfile::kFeatures;
+                if (mb.fromBase64Encoding (t["data"].toString()) && mb.getSize() == 4 * n)
+                {
+                    int k = 0;
+                    for (auto* arr : { p.muHit, p.varHit, p.muBleed, p.varBleed }) mb.copyTo (arr, (int) (n * (size_t) k++), n);
+                    p.hits = t["hits"]; p.bleeds = t["bleeds"]; p.f0Hz = t["f0"];
+                    p.scoreHit = t["scoreHit"]; p.scoreBleed = t["scoreBleed"];
+                    p.valid = p.hits > 0 && p.scoreHit > p.scoreBleed;
+                }
+                state.removeChild (t, nullptr);
+            }
+            apvts.replaceState (state);
+            { const SpinLock::ScopedLockType sl (profileLock); savedProfile = p; }
+            engine.profileIn.push (p);   // an empty profile clears whatever was learned before
+        }
 }
 
 AudioProcessorEditor* TheGateProcessor::createEditor() { return new TheGateEditor (*this); }
