@@ -27,6 +27,7 @@ warnings.filterwarnings("ignore")
 KICK, SNARE = ["kick_in", "kick_port", "kick_out"], ["snare_bot", "snare_top"]
 TOMS = ["rack1", "rack2", "floor1", "floor2"]
 SURE_DB, UNSURE_DB = 12.0, 6.0
+KICK_RING_DB = 12.0   # a tom 'hit' on a kick this far under the tom's median hit is sympathetic ring
 TOM_FLOOR_SURE, TOM_FLOOR_UNSURE = 18.0, 30.0   # dB below the tom's loudest hits (99.5th pct)
 STICK_HZ = 1500.0
 
@@ -160,6 +161,18 @@ def label_song(path, cache=None):
             sure = ex[t][e] >= SURE_DB and lv[t][e] >= top - TOM_FLOOR_SURE and toms[lead_tom[e]] == t
             add(t, t, e, sure, f"{ex[t][e]:.0f} dB over expected bleed, {lv[t][e] - top:.0f} dB re loudest", {"excess_db": round(float(ex[t][e]), 1)})
         info[t] = {"bleed_ratio_db": {s: round(B[(s, t)], 1) for s in list(struck) + refs + [o for o in toms if o != t]}}
+
+    # a tom "hit" within 10 ms of a kick, 12+ dB under that tom's loud hits (75th pct), is the tom
+    # ringing off the kick (Corey confirmed by ear: floor tom 2, Song 1) - not a stroke
+    kick_t = np.array([h["sample"] for h in hits if h["drum"] == "kick" and h["sure"]])
+    for t in toms:
+        lv_sure = [h["level_dbfs"] for h in hits if h["drum"] == t and h["sure"]]
+        if not lv_sure or not len(kick_t): continue
+        med = float(np.percentile(lv_sure, 75))   # the tom's real hits (the ring events drag a median down)
+        for h in hits:
+            if h["drum"] == t and h["sure"] and h["level_dbfs"] < med - KICK_RING_DB and np.min(np.abs(kick_t - h["sample"])) <= int(0.010 * sr):
+                h["sure"] = False; h["why"] = "on a kick, far under this tom's hits: ringing off the kick"
+                info.setdefault(t, {})["demoted_on_kick"] = info.get(t, {}).get("demoted_on_kick", 0) + 1
 
     # one label per drum per 20 ms; SURE beats UNSURE at the same hit
     hits.sort(key=lambda h: (h["drum"], h["sample"]))
