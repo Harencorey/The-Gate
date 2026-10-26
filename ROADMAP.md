@@ -91,6 +91,9 @@ It ships in stages so every release is something usable in a real session.
     - Self-learning from one track with no help (`training/session_eval.py`): small gain, and unsafe on toms that are rarely played - in some songs most of what it would learn as "the tom" is really snare/kick bleed. Not shipped.
     - Taught from ~8 clean hits the user points at: floor toms let through 40-70% fewer false opens than the Source key alone at 90% of hits kept; snare ~25% fewer; rack 2 no help (its own problem, to look at).
     - So the learned check comes in as a user-controlled "Learn" step (Phase 5's guided capture moved forward), and it can only reject what the gate would open, never open it.
+    - **Built (branch `phase-5-learn`):** LEARN button + Strictness in Source mode. Profile = per-feature hit/bleed statistics of each opening's first 12 ms; saved with the session; it pins the Source key's fundamental. Tested: no allocations, profile survives save/load, synthetic snare bleed taken back with toms untouched.
+    - **Measured on the 7 songs (8 taught hits per song, Strictness 50):** at the thresholds you'd actually use, the same hits pass and leak is unchanged (within 0.1%). It only took back 0-4 openings per song: the Source key already rejects nearly all bleed *openings*. What's left of the leak is the gate being *held open* by bleed during a tom's tail - a closing problem, which the learned check doesn't touch (yet). At very low thresholds it cuts leak (floor 1 at -42 dBFS: 48% -> 33%) but starts losing hits.
+    - Next: use the same profile while the gate is open (does what's holding it open still sound like the drum?), and the factory models once there are enough kits.
 
 ### Phase 5: User training and live learning
 - Guided two-step capture: "learn the source", then "learn the bleed", feeling like one gesture.
