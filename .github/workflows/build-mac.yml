@@ -21,7 +21,7 @@ jobs:
     runs-on: macos-14   # Apple Silicon runner; the build itself is universal (arm64 + x86_64)
     timeout-minutes: 60
     env:
-      VERSION: 0.1.${{ github.run_number }}
+      VERSION: 0.2.${{ github.run_number }}
       ART: build-mac/TheGate_artefacts/Release
     steps:
       - uses: actions/checkout@v4
@@ -146,7 +146,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # "latest" is replaced on every build; this one (v0.1.N) is kept forever so any
+          # "latest" is replaced on every build; this one (v0.2.N) is kept forever so any
           # past version can be reinstalled. What changed = this commit's message.
           {
             echo "**The Gate ${VERSION}**, built from ${GITHUB_SHA::7} on $(date -u +%Y-%m-%d). Passed the engine and plug-in tests, Apple auval and pluginval (strictness 10)."

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 if(NOT DEFINED TG_VERSION)
-    set(TG_VERSION 0.1.0)   # CI passes 0.1.<build number>
+    set(TG_VERSION 0.2.0)   # CI passes 0.2.<build number>
 endif()
 project(TheGate VERSION ${TG_VERSION} LANGUAGES C CXX)
 
