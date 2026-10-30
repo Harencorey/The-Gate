@@ -453,7 +453,7 @@ static void testLevelerFixedTarget()
 {
     std::printf ("Leveler: every hit lands on the target; Amount and Max scale and limit the change\n");
     const double sr = 48000;
-    const std::vector<float> peaks { -6, -20, -3, -15, -24, -9, -18, -12, -4, -22 };
+    const std::vector<float> peaks { -6, -16, -4, -15, -20, -9, -18, -12, -5, -19 };
     Buf in = makeBuf (1, 12000 * peaks.size() + 24000);
     const auto starts = makeHits (in[0], sr, peaks, 12000);
 
@@ -516,8 +516,8 @@ static void testLevelerTransientUntouched()
     for (float laMs : { 2.0f, 5.0f, 10.0f, 20.0f })
     {
         Buf in = makeBuf (1, 48000);
-        // loud, soft (+9 dB), loud (-6 dB); 250 ms apart, so each tail has died away under the next hit
-        const auto starts = makeHits (in[0], sr, { -3.0f, -21.0f, -6.0f }, 12000);
+        // loud, soft, loud; 250 ms apart, so each tail has died away under the next hit
+        const auto starts = makeHits (in[0], sr, { -3.0f, -17.0f, -6.0f }, 12000);
         tg::GateSettings s = levelerSettings(); s.lookaheadMs = laMs;
         tg::GateEngine e;
         Buf out = run (in, s, sr, 0, nullptr, 7, &e);
@@ -532,7 +532,7 @@ static void testLevelerTransientUntouched()
                     const double gk = out[0][i + L] / in[0][i];
                     gMin = std::min (gMin, gk); gMax = std::max (gMax, gk);
                 }
-            const int la = (int) std::lround (laMs * 48), G = std::clamp (la / 4, 1, 48), P = std::min (24, la / 8);
+            const int la = (int) std::lround (laMs * 48), G = std::max (std::min (la / 4, 48), (int) (0.4 * la)), P = std::min (24, la / 8);
             const size_t W = (size_t) (la - G - P);
             const double expect = std::pow (10.0, (-12.0 - peakDbIn (in[0], starts[k], starts[k] + W)) / 20.0);
             if (k == 1) std::printf ("  lookahead %2.0f ms: sees the first %.2f ms of each hit\n", laMs, W / 48.0);
@@ -576,7 +576,7 @@ static void testLevelerNoLookahead()
     std::printf ("Leveler with Lookahead Off still levels (gain lands 2 ms into the hit)\n");
     const double sr = 48000;
     Buf in = makeBuf (1, 48000);
-    const auto starts = makeHits (in[0], sr, { -3.0f, -21.0f }, 12000);
+    const auto starts = makeHits (in[0], sr, { -3.0f, -17.0f }, 12000);
     tg::GateSettings s = levelerSettings(); s.lookaheadMs = 0.0f;
     tg::GateEngine e;
     Buf out = run (in, s, sr, 0, nullptr, 2, &e);
@@ -585,6 +585,26 @@ static void testLevelerNoLookahead()
     const double wantDb = -12.0 - peakDbIn (in[0], starts[1], starts[1] + 48);
     std::printf ("  5 ms into the soft hit: %+.2f dB (aimed %+.2f from the first 1 ms)\n", gotDb, wantDb);
     CHECK (std::abs (gotDb - wantDb) < 0.05, "gain %.2f dB, expected %.2f", gotDb, wantDb);
+}
+
+static void testLevelerLeavesBleedAlone()
+{
+    std::printf ("Leveler with the threshold all the way down: bleed far under the hits isn't pulled up, gain moves smoothly\n");
+    const double sr = 48000;
+    std::vector<float> peaks;
+    for (int k = 0; k < 16; ++k) { peaks.push_back (k % 4 == 1 ? -14.0f : -6.0f); peaks.push_back (-32.0f); }   // hits, with bleed between
+    Buf in = makeBuf (1, 6000 * peaks.size() + 24000);
+    const auto starts = makeHits (in[0], sr, peaks, 6000);
+    tg::GateSettings s = levelerSettings(); s.thresholdDb = -80.0f; s.hysteresisDb = 0.0f; s.levelTarget = tg::GateSettings::kAutoTarget;
+    s.levelMaxDb = 21.9f; s.lookaheadMs = 10.0f;
+    tg::GateEngine e;
+    Buf out = run (in, s, sr, 0, nullptr, 4, &e);
+    const size_t L = (size_t) e.currentLatency();
+    double worstBleed = -1e9;
+    for (size_t k = 5; k < starts.size(); k += 2)
+        worstBleed = std::max (worstBleed, (double) (peakDbIn (out[0], starts[k] + L, starts[k] + L + 480) - peakDbIn (in[0], starts[k], starts[k] + 480)));
+    std::printf ("  bleed events turned up by at most %+.1f dB (100 %% Amount, Max 21.9 dB would pull them up ~20 dB)\n", worstBleed);
+    CHECK (worstBleed < 6.0, "bleed pulled up %+.1f dB", worstBleed);
 }
 
 static void testLevelerClickFreeAndOff()
@@ -1163,6 +1183,7 @@ int main()
     testLevelerTransientUntouched();
     testLevelerRolls();
     testLevelerNoLookahead();
+    testLevelerLeavesBleedAlone();
     testLevelerClickFreeAndOff();
     testGlowTransparentBelowCurve();
     testGlowDriveAndAutoGain();

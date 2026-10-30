@@ -109,6 +109,7 @@ public:
     static constexpr int    kFrameSamples   = 128;   // samples per UI meter frame
     static constexpr int    kLookaheadFade  = 64;    // samples to fade out/in when lookahead changes
     static constexpr float  kFullyShutDb    = -80.0f;
+    static constexpr double kLevelIgnoreDb  = 18.0;  // leveler: events this far under the real hits aren't leveled
 
     void prepare (double sampleRate, int maxChannels)
     {
@@ -179,6 +180,7 @@ public:
         lvlUser = 1.0;
         lvlAvgDb = 0.0;
         lvlHaveAvg = false;
+        lvlHaveRef = false; lvlRefDb = 0.0;
         lvlMarkAt = UINT64_MAX;
         glow.reset();
         // (the FIFOs are drained by their consumer; clearing them here would race the UI thread)
@@ -236,7 +238,9 @@ public:
         const double slopeRel = std::exp (-1.0 / (0.005 * sr));
         const int oneMs = std::max (1, (int) std::lround (0.001 * sr));
         // Leveler timing (see the header): measure for W samples, glide for G, finish P before the hit
-        const int G = la > 0 ? std::clamp (la / 4, 1, oneMs) : oneMs;
+        // glide over ~40 % of the lookahead (2 ms at 5 ms, 4 ms at 10 ms): a big change on the last hit's tail
+        // eases in instead of stepping. The peak is measured over most of the rest (a drum peaks in its first few ms).
+        const int G = la > 0 ? std::max (std::min (la / 4, oneMs), (int) (0.4 * la)) : oneMs;
         const int P = la > 0 ? std::min (oneMs / 2, la / 8) : 0;
         const int W = la > 0 ? std::max (1, la - G - P) : oneMs;
         const double lvlStepOff = 1.0 / std::max (1.0, 0.010 * sr);   // 10 ms on/off glide
@@ -321,12 +325,12 @@ public:
                 if (atkEnv > atkJump * atkValley && atkEnv > 1e-5) { lastAttack = clock; haveAttack = true; atkValley = atkEnv; }
                 if ((clock % 4096) == 0)
                 {
-                    // a learned profile pins the fundamental to the drum it was taught on (loud bleed - a snare in
-                    // a tom mic - can otherwise drag the running estimate onto its own pitch)
-                    const double f0 = (profile.valid && ! learning && profile.f0Hz > 0.0f) ? (double) profile.f0Hz : spectral.fundamentalHz();
+                    const double f0 = spectral.fundamentalHz();
                     if (f0 > 0.0 && std::abs (f0 - srcF0) > 0.5) { srcF0 = f0; srcBp1.setup (f0, sr, 2.0); srcBp2.setup (f0, sr, 2.0); }
                 }
-                if (srcF0 > 0.0) srcBand = srcBp2.bandPass (srcBp1.bandPass (hp));
+                // the key HPF still applies, unless it would cut into the drum's own fundamental (a Key HPF at
+                // 600 Hz on a kick muted the Source key completely)
+                if (srcF0 > 0.0) srcBand = srcBp2.bandPass (srcBp1.bandPass (hpfOn && s.keyHpfHz > srcF0 / 1.5 ? k : hp));
             }
             {
                 const size_t tw = (size_t) (clock & (uint64_t) toneMask);
@@ -631,7 +635,8 @@ public:
             if (lvlGlideLeft > 0)
             {
                 --lvlGlideLeft;
-                lvlGain = lvlGlideLeft == 0 ? lvlTo : lvlTo + (lvlFrom - lvlTo) * (double) lvlGlideLeft / (double) lvlGlideLen;
+                const double r = (double) lvlGlideLeft / (double) lvlGlideLen;   // 1 -> 0
+                lvlGain = lvlGlideLeft == 0 ? lvlTo : lvlTo + (lvlFrom - lvlTo) * (0.5 - 0.5 * std::cos (M_PI * r));   // S-curve: no corners
             }
             const double userT = s.levelerOn ? 1.0 : 0.0;
             if (lvlUser < userT)      lvlUser = std::min (userT, lvlUser + lvlStepOff);
@@ -746,6 +751,21 @@ private:
     {
         const double peakDb = gainToDb (std::max (pd.audioPeak, 1e-6));
         pd.hit.audioPeakDb = (float) peakDb;
+        // Far under the hits so far (bleed, noise, a tail wobble - what a low threshold lets through): not a hit
+        // to level. Leave the gain where it is and keep it out of the average, so it's never pulled up by
+        // as much as Max allows (that pumping, and the jumps in gain, were the artifacts at low thresholds).
+        // The reference is the level of the real hits: it rises quickly to louder hits and only drifts down with
+        // hits near it, so a stream of quiet bleed (a snare in the kick mic) can't drag it down.
+        if (! lvlHaveRef) { lvlRefDb = peakDb; lvlHaveRef = true; }
+        else if (peakDb > lvlRefDb) lvlRefDb += 0.5 * (peakDb - lvlRefDb);
+        else if (peakDb > lvlRefDb - 12.0) lvlRefDb += (peakDb - lvlRefDb) / 8.0;
+        if (peakDb < lvlRefDb - kLevelIgnoreDb)
+        {
+            pd.hit.levelChangeDb = 0.0f;
+            return;
+        }
+        // the average started on something much quieter (the first event was bleed): start it again on the hits
+        if (lvlHaveAvg && lvlAvgDb < lvlRefDb - 12.0) lvlAvgDb = peakDb;
         const bool autoT = s.levelTarget <= GateSettings::kAutoTarget + 1.0f;
         const double target = autoT ? (lvlHaveAvg ? lvlAvgDb : peakDb) : (double) s.levelTarget;
         const double maxDb = std::clamp ((double) s.levelMaxDb, 0.0, 48.0);
@@ -845,6 +865,8 @@ private:
     double lvlGain = 1.0, lvlFrom = 1.0, lvlTo = 1.0, lvlUser = 1.0, lvlAvgDb = 0.0;
     int lvlGlideLeft = 0, lvlGlideLen = 1;
     bool lvlHaveAvg = false;
+    double lvlRefDb = 0.0;      // level of the real hits (for telling them from what a low threshold lets through)
+    bool lvlHaveRef = false;
     uint64_t lvlMarkAt = UINT64_MAX;
     float lvlMarkDb = 0.0f;
 

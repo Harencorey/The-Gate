@@ -424,7 +424,14 @@ private:
         double top = 0.0;
         // the fundamental: the source's strongest low resonance (on Corey's kit this is right for every tom,
         // including floor 2 at ~59 Hz, where the kick sits close by - that pair needs the stick-attack check)
-        fundHz = maxBin * binHz < 1000.0 ? maxBin * binHz : 0.0;
+        {
+            // between bins: a parabola through the peak and its neighbours (bins are ~12 Hz apart at 48 kHz,
+            // a big step for a kick at ~55 Hz when the Source key's band is only a third of an octave wide)
+            const double a0 = dbAt (maxBin - 1), b0 = dbAt (maxBin), c0 = dbAt (maxBin + 1), den = a0 - 2.0 * b0 + c0;
+            const double frac = den < -1e-9 ? std::clamp (0.5 * (a0 - c0) / den, -0.5, 0.5) : 0.0;
+            const double hz = (maxBin + frac) * binHz;
+            fundHz = hz < 1000.0 ? hz : 0.0;
+        }
         if (maxBin * binHz < 1000.0)
         {
             const double sixth = std::pow (2.0, 1.0 / 6.0);

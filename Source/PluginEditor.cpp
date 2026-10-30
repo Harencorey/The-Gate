@@ -404,8 +404,17 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     // Learn: teach the gate this drum from a passage you pick
     makeKnob (strictness, tg::pid::strictness, "STRICTNESS", "How much like the learned drum an opening must sound before it's let through. 0 % = the learned check is off (the Source key alone). Higher = more bleed taken out, and more risk of losing a soft or odd hit. The check only ever takes openings away; it never opens the gate.");
     learnBtn.setClickingTogglesState (true);
-    learnBtn.setTooltip ("Press, play (or loop) a passage with clean hits of this drum, press again. Every opening while it's lit is learned as the drum; stick attacks that don't open the gate are learned as bleed. Set the threshold so only real hits open it while you learn. Needs Key = Source.");
-    learnBtn.onClick = [this] { proc.learnArmed.store (learnBtn.getToggleState()); };
+    learnBtn.setTooltip ("Press, play (or loop) a passage with clean hits of this drum, press again. Every opening while it's lit is learned as the drum; stick attacks that don't open the gate are learned as bleed. Set the threshold so only real hits open it while you learn. Switches the Key to Source if it isn't already.");
+    learnBtn.onClick = [this]
+    {
+        // Learn needs the Source key: pressing it on another key switches the key to Source first
+        if (learnBtn.getToggleState() && (int) std::lround (proc.apvts.getRawParameterValue (tg::pid::keySource)->load()) != 2)
+            if (auto* k = proc.apvts.getParameter (tg::pid::keySource))
+            {
+                k->beginChangeGesture(); k->setValueNotifyingHost (k->convertTo0to1 (2.0f)); k->endChangeGesture();
+            }
+        proc.learnArmed.store (learnBtn.getToggleState());
+    };
     learnBtn.setToggleState (proc.learnArmed.load(), dontSendNotification);
     addAndMakeVisible (learnBtn);
     clearBtn.setTooltip ("Forget what was learned (back to the Source key alone).");
@@ -468,7 +477,10 @@ void TheGateEditor::timerCallback()
     repaint (learnNote);
     {
         const bool src = (int) std::lround (proc.apvts.getRawParameterValue (tg::pid::keySource)->load()) == 2;
-        learnBtn.setEnabled (src || learnBtn.getToggleState());
+        learnBtn.setEnabled (true);
+        // in Source mode the gate listens at the drum's fundamental: the key HPF / high cut / tracking don't apply
+        const float kf = src ? 0.35f : 1.0f;
+        for (auto* k : { &keyHpf, &keyHighCut, &tracking }) { k->slider.setAlpha (kf); k->label.setAlpha (kf); }
         const bool have = proc.engine.uiProfileHits.load() > 0;
         clearBtn.setEnabled (have);
         const float a = src && have ? 1.0f : 0.4f;
@@ -524,7 +536,7 @@ void TheGateEditor::paint (Graphics& g)
         Colour c = colours::text;
         if (keyMode != 2 && ! learnBtn.getToggleState())
         {
-            line1 = "Learn works with Key = Source.";
+            line1 = "Learn uses Key = Source: pressing LEARN switches to it.";
             line2 = have > 0 ? "A profile from " + String (have) + " hits is kept for when you switch back." : String();
             c = colours::dim;
         }

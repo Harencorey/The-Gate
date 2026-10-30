@@ -20,6 +20,7 @@ int main (int argc, char** argv)
     tg::GateSettings s;
     s.rangeDb = -80.0f;
     double learnFrom = -1.0, learnTo = -1.0;   // learn=a-b: Learn armed from a to b seconds
+    std::string gainOut;                        // gainout=path: the leveler gain per sample (float32), aligned with the output   // learn=a-b: Learn armed from a to b seconds
     for (int a = 5; a < argc; ++a)
     {
         std::string kv = argv[a];
@@ -27,6 +28,7 @@ int main (int argc, char** argv)
         if (eq == std::string::npos) continue;
         const std::string k = kv.substr (0, eq);
         const float v = (float) std::atof (kv.c_str() + eq + 1);
+        if (k == "gainout") { gainOut = kv.substr (eq + 1); continue; }
         if (k == "learn") { std::sscanf (kv.c_str() + eq + 1, "%lf-%lf", &learnFrom, &learnTo); continue; }
         if      (k == "thr")     s.thresholdDb = v;
         else if (k == "hyst")    s.hysteresisDb = v;
@@ -46,6 +48,12 @@ int main (int argc, char** argv)
         else if (k == "src")     s.sourceKey = v > 0.5f;
         else if (k == "srcatk")  s.sourceAttackDb = v;
         else if (k == "strict")  s.strictness = v;
+        else if (k == "lamt")    s.levelAmount = v;
+        else if (k == "lmax")    s.levelMaxDb = v;
+        else if (k == "ltgt")    s.levelTarget = v;
+        else if (k == "glow")    s.glow.on = v > 0.5f;
+        else if (k == "gdrive")  s.glow.drive = v;
+        else if (k == "genv")    s.glow.envAmount = v;
         else { std::fprintf (stderr, "unknown setting %s\n", k.c_str()); return 1; }
     }
     FILE* f = std::fopen (argv[1], "rb");
@@ -62,10 +70,12 @@ int main (int argc, char** argv)
     eng->setSettings (s);
     eng->reset();
     const int L = eng->currentLatency();
-    const int B = 256;
+    const int B = gainOut.empty() ? 256 : 1;
+    std::vector<float> lg;
+    if (! gainOut.empty()) lg.reserve ((size_t) n + (size_t) L);
     std::vector<float> y ((size_t) n + (size_t) L + B, 0.0f), buf (B);
     FILE* hf = std::fopen (argv[3], "w");
-    std::fprintf (hf, "arrival,time,peakDb\n");
+    std::fprintf (hf, "arrival,time,peakDb,audioPeakDb,levelChangeDb\n");
     for (long p = 0; p < n + L; p += B)
     {
         const int len = (int) std::min<long> (B, n + L - p);
@@ -75,12 +85,19 @@ int main (int argc, char** argv)
         eng->setSettings (s);
         eng->process (io, 1, nullptr, 0, len);
         std::memcpy (y.data() + p, buf.data(), sizeof (float) * (size_t) len);
+        if (! gainOut.empty()) lg.push_back ((float) eng->currentLevelerGain());
         tg::Hit h;
-        while (eng->hits.pop (h)) std::fprintf (hf, "%llu,%llu,%.2f\n", (unsigned long long) h.arrivalSample, (unsigned long long) h.timeSamples, h.peakDb);
+        while (eng->hits.pop (h)) std::fprintf (hf, "%llu,%llu,%.2f,%.2f,%.2f\n", (unsigned long long) h.arrivalSample, (unsigned long long) h.timeSamples, h.peakDb, h.audioPeakDb, h.levelChangeDb);
         tg::MeterFrame mf;
         while (eng->meters.pop (mf)) {}
     }
     std::fclose (hf);
+    if (! gainOut.empty())
+    {
+        FILE* gf = std::fopen (gainOut.c_str(), "wb");
+        std::fwrite (lg.data() + L, sizeof (float), (size_t) n, gf);
+        std::fclose (gf);
+    }
     FILE* of = std::fopen (argv[2], "wb");
     std::fwrite (y.data() + L, sizeof (float), (size_t) n, of);
     std::fclose (of);
