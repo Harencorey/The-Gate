@@ -10,6 +10,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
+#include <string>
 #include <cstdlib>
 #include <functional>
 #include <new>
@@ -1161,6 +1163,45 @@ static void testLearn()
     CHECK (allocs == 0, "%ld allocations on the audio thread", allocs);
 }
 
+static void testDeBleed()
+{
+    std::printf ("De-bleed: crash wash comes out of the tom tails; attacks and the body untouched; 0 %% is bit-identical\n");
+    const double sr = 48000;
+    auto ses = sim::tomMicSession (sr, 30, 110.0, -12.0);
+    Buf in = makeBuf (1, ses.mix.size()); in[0] = ses.mix;
+    tg::GateSettings s = tomGate(); s.lookaheadMs = 15;
+    tg::GateEngine e0; Buf off = run (in, s, sr, 256, nullptr, 1, &e0);
+    const size_t L = (size_t) e0.currentLatency();
+    s.deBleed = 0.0f;
+    tg::GateEngine eZ; Buf zero = run (in, s, sr, 333, nullptr, 2, &eZ);
+    bool same = true;
+    for (size_t i = 0; i < off[0].size(); ++i) same = same && off[0][i] == zero[0][i];
+    CHECK (same, "De-bleed 0 %% isn't bit-identical to the plain gate");
+    std::vector<size_t> plain;   // tom hits with no crash on them (and none still ringing from a crash before)
+    for (size_t k = 0; k < ses.toms.size(); ++k)
+        if (std::find (ses.crashedToms.begin(), ses.crashedToms.end(), ses.toms[k]) == ses.crashedToms.end()) plain.push_back (ses.toms[k]);
+    for (float amt : { 50.0f, 100.0f })
+    {
+        s.deBleed = amt;
+        tg::GateEngine e; Buf o = run (in, s, sr, 256, nullptr, 3, &e, amt == 100.0f);
+        const long allocs = gAllocCount;
+        const double wash = bandEnergyDb (o[0], ses.crashedToms, L, 4000, 14000, 60, 500, sr) - bandEnergyDb (off[0], ses.crashedToms, L, 4000, 14000, 60, 500, sr);
+        const double body = bandEnergyDb (o[0], ses.toms, L, 60, 400, 20, 500, sr) - bandEnergyDb (off[0], ses.toms, L, 60, 400, 20, 500, sr);
+        double worstAtt = 0.0;
+        for (double lo : { 60.0, 2000.0, 6000.0 })
+        {
+            const double hi = lo == 60.0 ? 400.0 : lo * 2.5;
+            worstAtt = std::max (worstAtt, std::abs (bandEnergyDb (o[0], ses.toms, L, lo, hi, 0, 8, sr) - bandEnergyDb (off[0], ses.toms, L, lo, hi, 0, 8, sr)));
+        }
+        std::printf ("  %3.0f %%: crash wash in the tails %+.1f dB, body %+.2f dB, attacks (first 8 ms, 3 bands) worst %.3f dB%s\n",
+                     amt, wash, body, worstAtt, amt == 100.0f ? (" , allocations " + std::to_string (allocs)).c_str() : "");
+        CHECK (wash < (amt == 100.0f ? -12.0 : -6.0), "%.0f %%: crash wash only %+.1f dB", amt, wash);
+        CHECK (std::abs (body) < 0.2, "%.0f %%: the body moved %+.2f dB", amt, body);
+        CHECK (worstAtt < 0.1, "%.0f %%: an attack changed %.3f dB", amt, worstAtt);
+        if (amt == 100.0f) CHECK (allocs == 0, "%ld allocations", allocs);
+    }
+}
+
 int main()
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0);
@@ -1200,6 +1241,7 @@ int main()
     testSpectralRestRampClean();
     testSourceKey();
     testLearn();
+    testDeBleed();
     std::printf ("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILED", gFailures);
     return gFailures == 0 ? 0 : 1;
 }

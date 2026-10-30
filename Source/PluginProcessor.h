@@ -66,7 +66,7 @@ private:
                           * lookahead {}, * keySource {}, * keyHpf {}, * keyHighCut {}, * tracking {}, * listen {},
                           * levelerOn {}, * levelAmount {}, * levelTarget {}, * levelMax {},
                           * glowOn {}, * glowType {}, * glowDrive {}, * glowEnv {},
-                          * specOn {}, * specFocus {}, * specSustain {}, * specTransient {}, * strictness {};
+                          * specOn {}, * specFocus {}, * specSustain {}, * specTransient {}, * strictness {}, * deBleed {};
     } raw;
 
     void drainProfile();                      // message thread: newest learned profile from the engine

@@ -6,6 +6,7 @@
 // Output is aligned with the input (the reported latency is removed).
 //==============================================================================
 #include "GateCore.h"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +49,8 @@ int main (int argc, char** argv)
         else if (k == "src")     s.sourceKey = v > 0.5f;
         else if (k == "srcatk")  s.sourceAttackDb = v;
         else if (k == "strict")  s.strictness = v;
+        else if (k == "debleed") s.deBleed = v;
+        else if (k == "dbatk")   s.deBleedAttackMs = v;
         else if (k == "lamt")    s.levelAmount = v;
         else if (k == "lmax")    s.levelMaxDb = v;
         else if (k == "ltgt")    s.levelTarget = v;
@@ -85,7 +88,7 @@ int main (int argc, char** argv)
         eng->setSettings (s);
         eng->process (io, 1, nullptr, 0, len);
         std::memcpy (y.data() + p, buf.data(), sizeof (float) * (size_t) len);
-        if (! gainOut.empty()) lg.push_back ((float) eng->currentLevelerGain());
+        if (! gainOut.empty()) lg.push_back (std::getenv ("RR_DEBLEED_GAIN") ? (float) std::pow (10.0, eng->deBleedGainDb() / 20.0) : (float) eng->currentLevelerGain());
         tg::Hit h;
         while (eng->hits.pop (h)) std::fprintf (hf, "%llu,%llu,%.2f,%.2f,%.2f\n", (unsigned long long) h.arrivalSample, (unsigned long long) h.timeSamples, h.peakDb, h.audioPeakDb, h.levelChangeDb);
         tg::MeterFrame mf;

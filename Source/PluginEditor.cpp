@@ -373,6 +373,7 @@ TheGateEditor::TheGateEditor (TheGateProcessor& p)
     makeKnob (hold,       tg::pid::hold,       "HOLD",       "How long the gate stays open after the key falls below the close threshold.");
     makeKnob (release,    tg::pid::release,    "RELEASE",    "Time to close through the whole range.");
     makeKnob (range,      tg::pid::range,      "RANGE",      "How far the gate closes. All the way down = fully shut.");
+    makeKnob (deBleed,    tg::pid::deBleed,    "DE-BLEED",   "Takes cymbal wash out of each hit's tail. Every stroke's attack passes untouched; after it, the highs (above ~2.5 kHz) may only die away as slowly as the drum's own body does - whatever rings on longer is cymbal, and it's turned down. The drum's low end is never touched, and it never opens or holds the gate. 0 % = off.");
     makeKnob (keyHpf,     tg::pid::keyHpf,     "KEY HPF",    "High-pass on the key only (24 dB/oct): keeps kick and bass bleed from opening the gate. Bottom = Off.");
     makeKnob (keyHighCut, tg::pid::keyHighCut, "HIGH CUT",   "Low-pass on the key only (24 dB/oct): keeps cymbals from opening the gate. Top = Off.");
     makeKnob (tracking,   tg::pid::tracking,   "TRACKING",   "The high cut follows each hit: open on the strike to catch the attack, then closing as the hit decays, so cymbal bleed in the tail can't hold the gate open. 100 % = one octave per 12 dB of decay.");
@@ -615,8 +616,8 @@ void TheGateEditor::resized()
     }
     {
         auto a = envArea.reduced (8).withTrimmedTop (18);
-        auto cols = columns (a.removeFromTop (120), 4);
-        placeKnob (attack, cols[0]); placeKnob (hold, cols[1]); placeKnob (release, cols[2]); placeKnob (range, cols[3]);
+        auto cols = columns (a.removeFromTop (120), 5);
+        placeKnob (attack, cols[0]); placeKnob (hold, cols[1]); placeKnob (release, cols[2]); placeKnob (range, cols[3]); placeKnob (deBleed, cols[4]);
     }
     {
         auto a = keyArea.reduced (8).withTrimmedTop (18);

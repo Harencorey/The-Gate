@@ -37,6 +37,7 @@
 #include "Svf.h"
 #include "SpectralDecay.h"
 #include "LearnedTone.h"
+#include "DeBleed.h"
 
 #include <atomic>
 
@@ -69,6 +70,10 @@ struct GateSettings
     // Learn (Source key only): see LearnedTone.h
     bool  learn        = false;    // armed: openings are learned as the drum, unopened stick attacks as bleed
     float strictness   = 50.0f;    // 0..100: how much like the learned drum an opening must sound (0 = check off)
+
+    // De-bleed: pulls cymbal wash out of each hit's tail (see DeBleed.h). 0 = off (bit-identical)
+    float deBleed      = 0.0f;
+    float deBleedAttackMs = 10.0f; // each hit's first part passes untouched
 
     // Leveler
     bool  levelerOn    = false;
@@ -131,6 +136,11 @@ public:
         atkHoldLen = (int) std::lround (0.002 * sr); attackWindow = (int) std::lround (0.010 * sr);
         spectral.prepare (sr, numCh);
         tone.prepare (sr);
+        debleed.prepare (sr, numCh);
+        dbLp1.setup (DeBleed::kSplitHz, sr, kButterQ1); dbLp2.setup (DeBleed::kSplitHz, sr, kButterQ2);
+        dbLowRel = std::exp (-1.0 / (0.030 * sr));
+        dbValleyRise = 1.0 - std::exp (-1.0 / (0.010 * sr));
+        dbLowRing.assign (ringSize, 0.0f);
         {
             const size_t need = (size_t) std::ceil (0.100 * sr);
             size_t n = 1; while (n < need) n <<= 1;
@@ -147,6 +157,9 @@ public:
         std::fill (stateRing.begin(), stateRing.end(), (uint8_t) 0);
         std::fill (onsetRing.begin(), onsetRing.end(), (uint8_t) 0);
         spectral.reset();
+        dbLp1.reset(); dbLp2.reset(); dbHil.reset(); dbLowEnv = dbHiEnv = dbHiValley = 0.0; dbHiHold = 0; numDbCand = 0; haveDbStroke = false;
+        std::fill (dbLowRing.begin(), dbLowRing.end(), 0.0f);
+        debleed.reset(); outWasOpen = outAheadWasOpen = false; haveSrcHitStart = false;
         std::fill (toneRaw.begin(), toneRaw.end(), 0.0f); std::fill (toneSrc.begin(), toneSrc.end(), 0.0f); std::fill (toneHi.begin(), toneHi.end(), 0.0f);
         checkActive = vetoBlock = false; numLearnHits = numBleedCands = 0; lastOpenBegan = 0; haveOpenBegan = false; lastBleedCand = 0;
         if (learning) tone.clearLearning();
@@ -206,6 +219,7 @@ public:
         laTarget = lookaheadSamples (s.lookaheadMs);
         glow.setSettings (s.glow);
         spectral.setSettings (s.spectral, s.releaseMs, s.rangeDb);
+        debleed.setSettings (s.deBleed, s.deBleedAttackMs);
     }
 
     int lookaheadSamples (float ms) const noexcept
@@ -371,6 +385,7 @@ public:
                 const uint64_t began = std::min (clock, haveAttack && clock - lastAttack <= (uint64_t) attackWindow ? lastAttack : std::min (riseStart, levelRiseStart));
                 const uint64_t room = (uint64_t) std::max (0, delayForState - 1);
                 const uint64_t from = std::max (began >= (uint64_t) oneMs ? began - (uint64_t) oneMs : 0, clock >= room ? clock - room : 0);
+                srcHitStart = std::max (began, from); haveSrcHitStart = true;   // the hit (record, leveler, de-bleed) starts here too
                 for (uint64_t t = from; t < clock; ++t) stateRing[(size_t) (t & (uint64_t) ringMask)] = 1;
                 lastOpenBegan = began; haveOpenBegan = true;
                 if (learning)
@@ -483,6 +498,9 @@ public:
                 return haveOnset ? std::max (t, lastOnset + 1) : t;
             };
             uint64_t t0 = backdate (riseStart);
+            if (haveSrcHitStart && detectorOpen && ! wasOpen)
+                t0 = haveOnset ? std::max (srcHitStart, lastOnset + 1) : srcHitStart;   // Source key: from the stick attack, not ~5 ms late
+            haveSrcHitStart = false;
             if (detectorOpen && wasOpen)
             {
                 // A new stroke while the gate is open shows up as a sharp edge (the key's slope
@@ -521,6 +539,55 @@ public:
             if (jumpEnv > lvlPeak)             { lvlPeak = jumpEnv; lvlValley = jumpEnv; }
             else if (jumpEnv < lvlValley)      lvlValley = jumpEnv;
             keyAbsRing[writePos] = (float) std::abs (kf);
+
+            //---------------- de-bleed: every stroke's attack must pass untouched, also strokes the gate's own
+            // onset logic times late or misses (fills, flams). A stick attack whose body (< 2.5 kHz) also comes up
+            // 2 dB within 4 ms is a drum stroke: mark it on the output timeline. A cymbal has the attack but no
+            // body, so a crash in a tom's tail is NOT protected - that's exactly the wash to take out.
+            {
+                double unusedHp;
+                const double lo = dbLp2.tick (dbLp1.tick (k, unusedHp), unusedHp);
+                const double aB = std::sqrt (dbHil.power (lo));
+                dbLowEnv = aB > dbLowEnv ? aB : aB + (dbLowEnv - aB) * dbLowRel;
+                dbLowRing[(size_t) (clock & (uint64_t) ringMask)] = (float) dbLowEnv;
+                // its own stick-attack check: the >1 kHz band jumping 6 dB over its level in the last ~10 ms (the Source
+                // key's check looks back 30 ms, so it misses the second stroke of a fast fill)
+                {
+                    const double ah = std::abs (hk);
+                    if (ah >= dbHiEnv) { dbHiEnv = ah; dbHiHold = atkHoldLen; }
+                    else if (dbHiHold > 0) --dbHiHold;
+                    else dbHiEnv = ah + (dbHiEnv - ah) * atkRel;
+                    if (dbHiEnv < dbHiValley) dbHiValley = dbHiEnv;
+                    else dbHiValley += (dbHiEnv - dbHiValley) * dbValleyRise;
+                }
+                const bool dbAttack = dbHiEnv > 2.0 * dbHiValley && dbHiEnv > 1e-5;
+                if (dbAttack) dbHiValley = dbHiEnv;
+                if (dbAttack && numDbCand < kMaxDbCand && (numDbCand == 0 || clock - dbCand[numDbCand - 1] > (uint64_t) oneMs * 15))
+                    dbCand[numDbCand++] = clock;
+                for (int q = 0; q < numDbCand;)
+                {
+                    const uint64_t ta = dbCand[q];
+                    if (clock >= ta + (uint64_t) (4 * oneMs))
+                    {
+                        const uint64_t pos = ta >= (uint64_t) oneMs ? ta - (uint64_t) oneMs : 0;
+                        const double before = dbLowRing[(size_t) (pos & (uint64_t) ringMask)];
+                        const uint64_t outNow = clock >= (uint64_t) la ? clock - (uint64_t) la : 0;
+                        if (dbLowEnv > 1.26 * before && dbLowEnv > 1e-5 && pos > outNow)
+                        {
+                            if (onsetRing[(size_t) (pos & (uint64_t) ringMask)] == 0) onsetRing[(size_t) (pos & (uint64_t) ringMask)] = 2;
+                            lastDbStroke = ta; haveDbStroke = true;
+                        }
+                        // a stick attack soon after a stroke but with no clear body rise: probably the next stroke of a
+                        // fill (the last one is still ringing). Protect its attack, but don't take it as the new reference.
+                        else if (haveDbStroke && ta - lastDbStroke < (uint64_t) (150 * oneMs) && pos > outNow
+                                 && onsetRing[(size_t) (pos & (uint64_t) ringMask)] == 0)
+                            onsetRing[(size_t) (pos & (uint64_t) ringMask)] = 3;
+                        dbCand[q] = dbCand[--numDbCand];
+                        continue;
+                    }
+                    ++q;
+                }
+            }
             if (onset)
             {
                 onsetPeak = onsetValley = slopeEnv;
@@ -646,16 +713,28 @@ public:
             //---------------- output: the gate (or the spectral decay) x leveler
             const float gf = (float) g * laFadeGain;
             const float lf = (float) lg;
-            const bool onsetNow = onsetRing[rAudio] != 0;
+            const uint8_t onsetMark = onsetRing[rAudio];   // 1 = a gate hit, 2/3 = a stroke the de-bleed found (see above)
+            const bool onsetNow = onsetMark == 1;
             onsetRing[rAudio] = 0;
             const int attackN = (int) attackSamples;
             const int peek = la > 0 ? std::min (attackN, la) : 0;
-            const bool onsetAhead = peek > 0 && onsetRing[(rAudio + (size_t) peek) & ringMask] != 0;
+            const uint8_t aheadMark = peek > 0 ? onsetRing[(rAudio + (size_t) peek) & ringMask] : 0;
+            const bool onsetAhead = aheadMark == 1;
             const bool gateClosed = stateRing[rAudio] == 0 && g <= gFloor + 1e-9;
             float gated[kMaxChannels];
             for (int c = 0; c < numChannels; ++c) gated[c] = audioRing[(size_t) c * ringSize + rAudio];
             // x * gate gain when the spectral decay is off (bit-exact), its shaped tail when on
             spectral.tick (gated, numChannels, gf, (float) gFloor * laFadeGain, onsetNow, onsetAhead, attackN, gateClosed);
+            {
+                float dry[kMaxChannels];
+                for (int c = 0; c < numChannels; ++c) dry[c] = audioRing[(size_t) c * ringSize + rAudio];
+                // a hit for the de-bleed: an onset, or the gate starting to open (whichever comes first)
+                const bool openNow = stateRing[rAudio] != 0 && ! outWasOpen;
+                const bool openAhead = peek > 0 && stateRing[(rAudio + (size_t) peek) & ringMask] != 0 && ! outAheadWasOpen;
+                outAheadWasOpen = peek > 0 && stateRing[(rAudio + (size_t) peek) & ringMask] != 0;
+                debleed.tick (dry, gated, numChannels, onsetMark == 1 || onsetMark == 2 || openNow, onsetMark == 3, aheadMark != 0 || openAhead, peek);
+                outWasOpen = stateRing[rAudio] != 0;
+            }
             if (s.listen)
             {
                 const float kOut = keyRing[rAudio] * laFadeGain;
@@ -721,6 +800,7 @@ public:
     float glowModulatedDrive() const noexcept { return glow.modulatedDrive(); }
     float glowAutoGainDb() const noexcept { return glow.autoGainDb(); }
     SpectralDecay& spectralDecay() noexcept { return spectral; }   // learned partials, UI snapshots
+    double deBleedGainDb() const noexcept { return debleed.highGainDb(); }
 
     // Learn: profiles in (from a saved session) and out (to save), plus status for the UI (any thread)
     SpscFifo<ToneProfile, 4> profileIn, profileOut;
@@ -872,12 +952,23 @@ private:
 
     MicroGlow glow;
     SpectralDecay spectral;
+    DeBleed debleed;
+    Svf dbLp1, dbLp2; HilbertPair dbHil;
+    double dbLowEnv = 0.0, dbLowRel = 0.999, dbHiEnv = 0.0, dbHiValley = 0.0, dbValleyRise = 0.001;
+    int dbHiHold = 0;
+    uint64_t lastDbStroke = 0; bool haveDbStroke = false;
+    std::vector<float> dbLowRing;
+    static constexpr int kMaxDbCand = 8;
+    uint64_t dbCand[kMaxDbCand] {};
+    int numDbCand = 0;
+    bool outWasOpen = false, outAheadWasOpen = false;
 
     // Learn
     ToneLearner tone;
     ToneProfile profile;
     std::vector<float> toneRaw, toneSrc, toneHi;
     size_t toneMask = 0;
+    uint64_t srcHitStart = 0; bool haveSrcHitStart = false;
     bool learning = false, checkOn = false, checkActive = false, vetoBlock = false, haveOpenBegan = false;
     double checkThr = 0.0;
     uint64_t checkE = 0, checkFrom = 0, checkAt = 0, vetoAttack = 0, lastOpenBegan = 0, lastBleedCand = 0;

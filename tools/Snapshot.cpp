@@ -48,6 +48,7 @@ int main (int argc, char** argv)
     set (tg::pid::specSustain, 40.0f);
     set (tg::pid::keySource, 2.0f);          // Source key, with Learn
     set (tg::pid::threshold, -20.0f);
+    set (tg::pid::deBleed, 60.0f);
     p.prepareToPlay (sr, 256);
     // mode (2nd arg): "learning" = Learn still lit at the end; otherwise learn over the first half, then use it
     const bool stillLearning = argc > 2 && String (argv[2]) == "learning";

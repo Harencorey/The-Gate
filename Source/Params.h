@@ -36,6 +36,7 @@ namespace tg::pid
 
     // Phase 5: Learn
     inline constexpr const char* strictness  = "strictness";
+    inline constexpr const char* deBleed     = "deBleed";
 }
 
 namespace tg

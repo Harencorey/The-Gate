@@ -75,6 +75,7 @@ AudioProcessorValueTreeState::ParameterLayout TheGateProcessor::createLayout()
                                            { return (v > 0.05f ? "+" : "") + String (roundToInt (v)) + " %"; })));
 
     // Learn
+    ps.push_back (std::make_unique<P> (ParameterID { tg::pid::deBleed, 1 }, "De-bleed", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f, pct));
     ps.push_back (std::make_unique<P> (ParameterID { tg::pid::strictness, 1 }, "Strictness", NormalisableRange<float> (0.0f, 100.0f, 0.1f), kStrictnessDefault, pct));
     return { ps.begin(), ps.end() };
 }
@@ -112,6 +113,7 @@ TheGateProcessor::TheGateProcessor()
     raw.specSustain = apvts.getRawParameterValue (tg::pid::specSustain);
     raw.specTransient = apvts.getRawParameterValue (tg::pid::specTransient);
     raw.strictness  = apvts.getRawParameterValue (tg::pid::strictness);
+    raw.deBleed     = apvts.getRawParameterValue (tg::pid::deBleed);
 
     engine.prepare (48000.0, 2);
     startTimerHz (10);
@@ -166,6 +168,7 @@ tg::GateSettings TheGateProcessor::readSettings() const noexcept
     s.spectral.transient = raw.specTransient->load();
     s.learn        = learnArmed.load();
     s.strictness   = raw.strictness->load();
+    s.deBleed      = raw.deBleed->load();
     return s;
 }
 

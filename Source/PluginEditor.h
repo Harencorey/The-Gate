@@ -105,7 +105,7 @@ private:
     GateDisplay display;
 
     Knob threshold, hysteresis, attack, hold, release, range, keyHpf, keyHighCut, tracking;
-    Knob levelAmount, levelTarget, levelMax, specTransient, specFocus, specSustain, strictness;
+    Knob levelAmount, levelTarget, levelMax, specTransient, specFocus, specSustain, strictness, deBleed;
     juce::TextButton learnBtn { "LEARN" }, clearBtn { "CLEAR" };
     ConcentricKnob glowDrive;
     SpectrumView spectrum;
