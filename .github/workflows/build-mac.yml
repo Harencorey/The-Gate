@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14   # Apple Silicon runner; the build itself is universal (arm64 + x86_64)
+    runs-on: macos-15   # Apple Silicon runner (macos-14 is retired Nov 2026); the build itself is universal (arm64 + x86_64)
     timeout-minutes: 60
     env:
       VERSION: 0.2.${{ github.run_number }}
